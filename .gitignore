@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 .env.local
+data/qdrant/
 data/uploads/*
 !data/uploads/.gitkeep
 .pytest_cache/
@@ -12,3 +13,10 @@ data/uploads/*
 dist/
 build/
 .mypy_cache/
+
+# Logfire project credentials written by `logfire auth`
+.logfire/
+
+# Derived exports for inspection - regenerate, never commit
+data/chunks-export.*
+data/guide.db

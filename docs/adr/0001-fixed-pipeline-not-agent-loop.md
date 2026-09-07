@@ -14,10 +14,10 @@ traceable path per request.
 ## Considered options
 
 - **Free-running agent loop.** Would buy multi-hop questions and self-correction
-  on empty retrieval. We get the useful part of both from the query planner
-  (which decomposes multi-part questions into several searches) and one
-  conditional retrieval retry, without unbounded turns on a public endpoint
-  where each turn costs money.
+  on empty retrieval. We get the useful part of both from the query planner,
+  which decomposes multi-part questions into several searches run in one pass
+  over the whole Corpus (ADR 0005), without unbounded turns on a public
+  endpoint where each turn costs money.
 - **Fixed pipeline (chosen).** Flat latency, which matters on a website widget
   where visitors abandon; each stage independently scoreable by the eval
   harness, so "the answer was wrong" resolves to a retrieval, rerank or
@@ -26,5 +26,5 @@ traceable path per request.
 ## Consequences
 
 The tool-call seam is preserved in the gateway. If live availability or rates
-are ever added - the one thing RAG must never answer from a cached crawl - that
+are ever added - the one thing RAG must never answer from an indexed document - that
 becomes a tool call at a known insertion point rather than a rewrite.

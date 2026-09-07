@@ -10,6 +10,11 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from app.config import Settings
+from app.gateway.budget import UsageExceeded, UsageLimiter
+from app.gateway.llm_gateway import LLMGateway
+from app.models.domain import Chunk, DocCategory, SourceKind
+from app.retrieval.store import VectorStore
 from app.storage.db import Database
 from app.storage.properties import ContactRoute, PropertyRepository, normalise_origin
 
@@ -145,3 +150,207 @@ class TestContactRoute:
         restored = ContactRoute.from_json(route.to_json())
         assert restored.phone == "+1 555"
         assert restored.url == "https://book.example"
+
+
+class TestAccountUsageCap:
+    """The ceiling under every model call.
+
+    The per-property cap above bills a Property. Ingestion, evals and CLI runs
+    bill none, so this is the only thing between a testing session and an
+    invoice - it has to hold across restarts and across callers.
+    """
+
+    @pytest_asyncio.fixture
+    async def db(self, tmp_path):
+        database = Database(str(tmp_path / "usage.db"))
+        await database.connect()
+        yield database
+        await database.close()
+
+    async def test_blocks_once_the_spend_cap_is_reached(self) -> None:
+        limiter = UsageLimiter(spend_cap_usd=0.10, call_cap=0)
+        await limiter.check("answer")  # nothing spent yet
+
+        await limiter.record(0.09)
+        await limiter.check("answer")  # still inside the cap
+
+        await limiter.record(0.02)
+        with pytest.raises(UsageExceeded) as exc:
+            await limiter.check("answer")
+        assert exc.value.limit == "spend"
+
+    async def test_blocks_a_loop_of_cheap_calls(self) -> None:
+        """A dollar cap alone cannot stop a fast loop: cost is only known after
+        the call, so the call ceiling is what catches it."""
+        limiter = UsageLimiter(spend_cap_usd=100.0, call_cap=3)
+        for _ in range(3):
+            await limiter.check("rewrite")
+            await limiter.record(0.0001)
+
+        with pytest.raises(UsageExceeded) as exc:
+            await limiter.check("rewrite")
+        assert exc.value.limit == "call"
+
+    async def test_zero_means_unlimited(self) -> None:
+        limiter = UsageLimiter(spend_cap_usd=0, call_cap=0)
+        await limiter.record(1000.0, calls=10_000)
+        await limiter.check("eval")
+
+    async def test_counters_survive_a_restart(self, db) -> None:
+        """Restarting the process must not hand it a fresh budget - otherwise
+        the cap is one Ctrl-C away from meaningless."""
+        first = UsageLimiter(spend_cap_usd=0.10, call_cap=0, db=db)
+        await first.check("answer")
+        await first.record(0.15)
+
+        second = UsageLimiter(spend_cap_usd=0.10, call_cap=0, db=db)
+        with pytest.raises(UsageExceeded):
+            await second.check("answer")
+
+    async def test_accounting_failure_never_blocks_the_caller(self, tmp_path) -> None:
+        """A broken ledger must not take the pipeline down with it."""
+        closed = Database(str(tmp_path / "closed.db"))
+        await closed.connect()
+        await closed.close()
+
+        limiter = UsageLimiter(spend_cap_usd=1.0, call_cap=0, db=closed)
+        await limiter.record(0.01)          # write fails, in-memory total stands
+        await limiter.check("answer")
+        assert limiter.snapshot()["spent_usd"] == pytest.approx(0.01)
+
+
+class TestGatewayPreflight:
+    """A misconfigured reranker degrades quietly - reranking catches provider
+    failures by design - so the configuration is checked once at boot instead."""
+
+    def test_refuses_a_reranker_it_has_no_key_for(self) -> None:
+        settings = Settings(
+            openai_api_key="sk-test",
+            cohere_api_key=None,
+            rerank_model="rerank-v3.5",
+        )
+        with pytest.raises(RuntimeError, match="COHERE_API_KEY"):
+            LLMGateway(settings).preflight()
+
+    def test_a_chat_reranker_needs_no_cohere_key(self) -> None:
+        settings = Settings(
+            openai_api_key="sk-test", cohere_api_key=None, rerank_model="gpt-4o-mini"
+        )
+        LLMGateway(settings).preflight()
+
+    def test_reports_every_missing_key_at_once(self) -> None:
+        """One boot, one list - not a key at a time across three restarts."""
+        settings = Settings(
+            openai_api_key=None, cohere_api_key=None, rerank_model="rerank-v3.5"
+        )
+        with pytest.raises(RuntimeError) as exc:
+            LLMGateway(settings).preflight()
+        assert "OPENAI_API_KEY" in str(exc.value)
+        assert "COHERE_API_KEY" in str(exc.value)
+
+
+class TestRunSpendCap:
+    """The per-process ceiling. Scoped to one run and never read back from the
+    ledger, so a single experiment is bounded regardless of the day's total."""
+
+    async def test_stops_a_run_at_its_own_ceiling(self) -> None:
+        limiter = UsageLimiter(spend_cap_usd=0, call_cap=0, run_cap_usd=0.50)
+        await limiter.record(0.49)
+        await limiter.check("answer")
+
+        await limiter.record(0.02)
+        with pytest.raises(UsageExceeded) as exc:
+            await limiter.check("answer")
+        assert exc.value.limit == "run spend"
+
+    async def test_a_fresh_run_starts_at_zero(self, tmp_path) -> None:
+        """The daily ledger is shared; the run counter is not. A new process
+        must get its own allowance, or the cap would be indistinguishable from
+        the daily one."""
+        database = Database(str(tmp_path / "run.db"))
+        await database.connect()
+        try:
+            first = UsageLimiter(
+                spend_cap_usd=0, call_cap=0, run_cap_usd=0.50, db=database
+            )
+            await first.record(0.60)
+            with pytest.raises(UsageExceeded):
+                await first.check("answer")
+
+            second = UsageLimiter(
+                spend_cap_usd=0, call_cap=0, run_cap_usd=0.50, db=database
+            )
+            await second.check("answer")
+            assert second.snapshot()["run_spent_usd"] == 0.0
+            # ...while the day's total carried over from the first run.
+            assert second.snapshot()["spent_usd"] == pytest.approx(0.60)
+        finally:
+            await database.close()
+
+    async def test_the_tightest_ceiling_wins(self) -> None:
+        limiter = UsageLimiter(spend_cap_usd=10.0, call_cap=0, run_cap_usd=0.05)
+        await limiter.record(0.06)
+        with pytest.raises(UsageExceeded) as exc:
+            await limiter.check("rerank")
+        assert exc.value.limit == "run spend"
+
+
+class TestEmbeddedVectorStore:
+    """QDRANT_URL doubles as the backend switch, so the parse has to be exact:
+    reading a directory path as a URL silently produces a client that connects
+    to nothing and fails on first use."""
+
+    def test_http_urls_mean_a_server(self) -> None:
+        # Key set explicitly rather than inherited from whatever .env holds:
+        # this assertion is about the URL parse, nothing else.
+        store = VectorStore(
+            Settings(qdrant_url="https://cluster.example:6333", qdrant_api_key="k")
+        )
+        assert not store.embedded
+
+    def test_anything_else_means_embedded(self, tmp_path) -> None:
+        assert VectorStore(Settings(qdrant_url=":memory:")).embedded
+        assert VectorStore(Settings(qdrant_url=str(tmp_path / "q"))).embedded
+
+    async def test_hybrid_search_works_without_a_server(self, tmp_path) -> None:
+        """The whole point: the real query path - two named vectors fused with
+        RRF, filtered to one tenant - runs in-process."""
+        store = VectorStore(Settings(qdrant_url=str(tmp_path / "qdrant")))
+        await store.ensure_collection(4)
+
+        chunk = Chunk(
+            chunk_id="c1",
+            doc_id="d1",
+            property_id="demo",
+            text="Dogs are welcome in The Barn.",
+            uri="upload://house-rules.pdf",
+            title="House rules",
+            heading_path=["Pets"],
+            category=DocCategory.POLICIES,
+            source_kind=SourceKind.UPLOAD,
+            position=0,
+            token_estimate=10,
+            fetched_at="2026-09-05",
+        )
+        await store.upsert([chunk], [[1.0, 0.0, 0.0, 0.0]], [([1, 2], [0.7, 0.3])])
+
+        hits = await store.hybrid_search(
+            "demo",
+            dense_vector=[1.0, 0.0, 0.0, 0.0],
+            sparse_vector=([1, 2], [0.7, 0.3]),
+            limit=5,
+        )
+        assert [h.chunk.text for h in hits] == ["Dogs are welcome in The Barn."]
+
+        # The tenant filter is not a server-side nicety - it must hold here too.
+        assert await store.count("someone-else") == 0
+        await store.close()
+
+    def test_ingestion_does_not_need_a_reranker_key(self) -> None:
+        """`guide upload` never reranks. Blocking an index build on a key it
+        will not use would stop an operator loading a corpus before the answer
+        path is configured at all."""
+        settings = Settings(
+            openai_api_key="sk-test", cohere_api_key=None, rerank_model="rerank-v3.5"
+        )
+        LLMGateway(settings).preflight(needs_rerank=False)

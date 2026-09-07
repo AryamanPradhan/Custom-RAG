@@ -46,7 +46,11 @@ async def chat(
             payload.message,
             [t.model_dump() for t in payload.history],
         )
-        log.info("chat.answered", **trace.to_dict(), deflected=result.deflected)
+        log.info(
+            "Deflected." if result.deflected else "Answered.",
+            **trace.to_dict(),
+            deflected=result.deflected,
+        )
         return ChatResponse(
             answer=result.answer,
             citations=[CitationOut(**asdict(c)) for c in result.citations],
@@ -88,10 +92,13 @@ async def chat_stream(
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as exc:  # noqa: BLE001
             METRICS.incr("chat.stream_error")
-            log.error("chat.stream_error", error=f"{type(exc).__name__}: {exc}")
+            log.error(
+                "The answer stream failed; the widget was told to retract.",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             yield f"data: {json.dumps({'type': 'error', 'message': 'Something went wrong.'})}\n\n"
         finally:
-            log.info("chat.answered", **trace.to_dict())
+            log.info("Stream finished.", **trace.to_dict())
             end_trace()
 
     return StreamingResponse(

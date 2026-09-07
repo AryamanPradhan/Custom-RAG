@@ -5,7 +5,7 @@ Three untrusted inputs reach the model on every turn:
   1. the Visitor's message
   2. the conversation history - which, because sessions are stateless, arrives
      from the browser and can say anything
-  3. the retrieved Chunks, which came off a crawled website
+  3. the retrieved Chunks, which came out of owner-supplied documents
 
 (3) is the one that gets skipped. Retrieved text is pasted into the prompt and
 read with the same weight as operator instructions unless something explicitly
@@ -153,7 +153,8 @@ def sanitise_context(chunks: list[ScoredChunk]) -> str:
       - every chunk is fenced and numbered, so the model can cite [n] and can
         tell page content apart from operator instruction
       - injected instructions inside the content are excised, not passed on
-      - the fetch date rides along, because re-crawls are manual and an answer
+      - the ingest date rides along, because a Corpus changes only when the
+        owner sends new material, and an answer
         may be citing a page that has since changed
     """
     if not chunks:

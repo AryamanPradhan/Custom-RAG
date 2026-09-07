@@ -1,14 +1,13 @@
 """Operator CLI.
 
-Everything an operator does by hand: onboard a client, crawl their site, check
-whether their corpus has drifted, ask the Guide a question, run the eval set.
+Everything an operator does by hand: onboard a client, index the documents they
+supplied, ask the Guide a question, run the eval set.
 
     guide onboard casa-verde "Casa Verde" --origin https://casaverde.com \\
           --phone "+44 1234 567890"
-    guide crawl casa-verde https://casaverde.com
     guide upload casa-verde ./house-rules.pdf
+    guide upload casa-verde ./data/demo-corpus        # a folder works too
     guide ask casa-verde "can I bring my dog?"
-    guide drift casa-verde
     guide eval casa-verde ./evals/casa-verde.json
 """
 
@@ -22,10 +21,12 @@ from pathlib import Path
 
 from app.config import get_settings
 from app.evals.harness import load_cases, run_eval
+from app.gateway.budget import get_usage_limiter
 from app.gateway.llm_gateway import LLMGateway
-from app.ingestion.drift import check_drift
+from app.ingestion.loaders import SUPPORTED_SUFFIXES, load_bytes
 from app.ingestion.pipeline import IngestionPipeline
 from app.logging_setup import configure_logging
+from app.observability.tracing import span
 from app.pipeline.answer import AnswerPipeline
 from app.retrieval.embeddings import get_dense_embedder, get_sparse_encoder
 from app.retrieval.retriever import Retriever
@@ -52,6 +53,7 @@ class _Context:
             ),
             rerank_top_n=self.settings.rerank_top_n,
             min_rerank_score=self.settings.min_rerank_score,
+            min_rerank_relevance=self.settings.min_rerank_relevance,
         )
 
     def ingestion(self) -> IngestionPipeline:
@@ -65,16 +67,23 @@ class _Context:
         )
 
 
-async def _build(*, need_embeddings: bool = True) -> _Context:
+async def _build(*, need_embeddings: bool = True, need_rerank: bool = True) -> _Context:
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, service="guide-cli")
     db = await init_db(settings.database_path)
     repo = PropertyRepository(db)
+    # Shares the day's budget with the running service - a CLI eval sweep and
+    # live traffic spend the same money.
+    get_usage_limiter(settings).attach(db)
 
     async def record(property_id: str, amount: float) -> None:
         await repo.record_spend(property_id, amount)
 
     gateway = LLMGateway(settings, on_spend=record)
+    if need_embeddings:
+        # `onboard` touches no model, so it stays usable before any key is set,
+        # and `upload` never reranks - each command checks only what it uses.
+        gateway.preflight(needs_rerank=need_rerank)
     store = VectorStore(settings)
     dense = get_dense_embedder(settings) if need_embeddings else None
     sparse = get_sparse_encoder(settings) if need_embeddings else None
@@ -104,36 +113,56 @@ async def _onboard(args) -> int:
         await close_db()
 
 
-async def _crawl(args) -> int:
-    ctx = await _build()
+def _collect(paths: list[str]) -> list[Path]:
+    """Files to ingest, from a mix of file and directory arguments.
+
+    Directories are walked rather than globbed by the caller, because the shell
+    that expands `*.pdf` on one machine leaves it literal on another.
+    """
+    found: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            found += sorted(
+                p for p in path.rglob("*")
+                if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES
+            )
+        else:
+            found.append(path)
+    return found
+
+
+async def _upload(args) -> int:
+    ctx = await _build(need_rerank=False)
     try:
-        report = await ctx.ingestion().ingest_site(
-            args.property_id, args.start_url, max_pages=args.max_pages
-        )
-        await ctx.repo.mark_crawled(args.property_id)
+        paths = _collect(args.paths)
+        if not paths:
+            print(f"Nothing to ingest under {', '.join(args.paths)}", file=sys.stderr)
+            return 1
+
+        # Loaded up front so the whole set is one ingest: one collection check,
+        # one hash lookup, one report - and one process load of the BM25 model.
+        documents = []
+        failures = 0
+        for path in paths:
+            try:
+                documents.append(load_bytes(args.property_id, path.name, path.read_bytes()))
+            except (OSError, ValueError) as exc:
+                failures += 1
+                print(f"  ! {exc}", file=sys.stderr)
+
+        report = await ctx.ingestion().ingest_documents(args.property_id, documents)
+        await ctx.repo.mark_ingested(args.property_id)
         print(
             f"{report.documents} documents -> {report.chunks} chunks "
             f"({report.skipped_unchanged} unchanged, {report.duration_seconds}s)"
         )
-        for error in report.errors[:10]:
-            print(f"  ! {error}", file=sys.stderr)
-        return 0 if report.chunks or report.skipped_unchanged else 1
-    finally:
-        await ctx.store.close()
-        await close_db()
-
-
-async def _upload(args) -> int:
-    ctx = await _build()
-    try:
-        path = Path(args.path)
-        report = await ctx.ingestion().ingest_upload(
-            args.property_id, path.name, path.read_bytes()
-        )
-        print(f"{report.documents} documents -> {report.chunks} chunks")
         for error in report.errors:
             print(f"  ! {error}", file=sys.stderr)
-        return 0 if report.chunks else 1
+        # A run where every document was already indexed is a success, not an
+        # empty one - re-sending a folder to change one file is the normal case.
+        indexed_or_current = report.chunks or report.skipped_unchanged
+        return 0 if indexed_or_current and not failures and not report.errors else 1
     finally:
         await ctx.store.close()
         await close_db()
@@ -146,7 +175,16 @@ async def _ask(args) -> int:
         if prop is None:
             print(f"No such property: {args.property_id}", file=sys.stderr)
             return 1
-        result = await ctx.answer_pipeline().answer(prop, args.question)
+        # One parent span, so a question reads as a single trace: plan,
+        # retrieve, rerank, generate, verify. Served requests get this from
+        # the FastAPI instrumentation instead.
+        with span("ask", question=args.question) as s:
+            result = await ctx.answer_pipeline().answer(prop, args.question)
+            s.summary = (
+                f"Deflected: {result.reason}."
+                if result.deflected
+                else f"Answered from {len(result.citations)} cited sources."
+            )
         print(f"\n{result.answer}\n")
         for citation in result.citations:
             stamp = f" (as published {citation.published_on})" if citation.published_on else ""
@@ -156,20 +194,6 @@ async def _ask(args) -> int:
         return 0
     finally:
         await ctx.store.close()
-        await close_db()
-
-
-async def _drift(args) -> int:
-    ctx = await _build(need_embeddings=False)
-    try:
-        report = await check_drift(ctx.db, ctx.settings, args.property_id)
-        print(report.summary())
-        for uri in report.changed:
-            print(f"  changed: {uri}")
-        for uri in report.unreachable:
-            print(f"  unreachable: {uri}")
-        return 0
-    finally:
         await close_db()
 
 
@@ -217,25 +241,15 @@ def main() -> int:
     p.add_argument("--cap", type=float, default=5.0, help="daily spend cap in USD")
     p.set_defaults(func=_onboard)
 
-    p = sub.add_parser("crawl", help="crawl and index a property website")
+    p = sub.add_parser("upload", help="index documents the owner supplied")
     p.add_argument("property_id")
-    p.add_argument("start_url")
-    p.add_argument("--max-pages", type=int, default=None)
-    p.set_defaults(func=_crawl)
-
-    p = sub.add_parser("upload", help="index a PDF or DOCX")
-    p.add_argument("property_id")
-    p.add_argument("path")
+    p.add_argument("paths", nargs="+", help="files or directories to index")
     p.set_defaults(func=_upload)
 
     p = sub.add_parser("ask", help="ask the Guide a question")
     p.add_argument("property_id")
     p.add_argument("question")
     p.set_defaults(func=_ask)
-
-    p = sub.add_parser("drift", help="check whether the corpus has fallen behind")
-    p.add_argument("property_id")
-    p.set_defaults(func=_drift)
 
     p = sub.add_parser("eval", help="run an eval case file")
     p.add_argument("property_id")

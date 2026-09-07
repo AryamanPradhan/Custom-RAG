@@ -20,6 +20,8 @@ import asyncio
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.gateway.budget import get_usage_limiter
+from app.gateway.pricing import cost_usd
 from app.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -56,13 +58,30 @@ class GeminiEmbedder:
             kwargs["task_type"] = task_type
         return types.EmbedContentConfig(**kwargs)
 
+    @staticmethod
+    def _as_contents(texts: list[str]) -> list[Any]:
+        """One Content per text - the difference between 32 vectors and 1.
+
+        google-genai coerces a plain `list[str]` into a *single* Content with
+        one part per string, so the API returns one embedding for the whole
+        batch. Wrapping each text in its own Content is what makes it a batch.
+        """
+        from google.genai import types
+
+        return [types.Content(parts=[types.Part(text=t)]) for t in texts]
+
     async def _embed(self, texts: list[str], task_type: str) -> list[list[float]]:
         out: list[list[float]] = []
+        limiter = get_usage_limiter()
         for i in range(0, len(texts), _BATCH):
             batch = texts[i : i + _BATCH]
+            # Embeddings are cheap per call and ruinous in bulk: one careless
+            # re-index of every property is thousands of calls that no
+            # per-property cap sees. Checked per batch, not per run.
+            await limiter.check("embed")
             result = await self._client.aio.models.embed_content(
                 model=self._model,
-                contents=batch,  # type: ignore[arg-type]  # SDK accepts a list of str
+                contents=self._as_contents(batch),
                 config=self._config(task_type),
             )
             returned = result.embeddings or []
@@ -75,6 +94,11 @@ class GeminiEmbedder:
             if self._legacy and self.dim != 3072:
                 vectors = [_normalise(v) for v in vectors]
             out.extend(vectors)
+
+            # The embed endpoint reports no usage, so bill the same ~4
+            # chars-per-token estimate the gateway uses for abandoned streams.
+            tokens = sum(len(t) for t in batch) // 4
+            await limiter.record(cost_usd(self._model, input_tokens=tokens))
         return out
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -131,7 +155,11 @@ def get_dense_embedder(settings: Settings | None = None) -> GeminiEmbedder:
     if _dense is None:
         settings = settings or get_settings()
         _dense = GeminiEmbedder(settings)
-        log.info("embeddings.dense_ready", model=settings.dense_model, dim=_dense.dim)
+        log.info(
+            f"Gemini embeddings ready ({settings.dense_model}, {_dense.dim}-dim).",
+            model=settings.dense_model,
+            dim=_dense.dim,
+        )
     return _dense
 
 

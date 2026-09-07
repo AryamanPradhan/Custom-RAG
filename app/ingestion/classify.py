@@ -44,7 +44,7 @@ _RULES: list[tuple[DocCategory, re.Pattern[str]]] = [
 ]
 
 _CLASSIFY_SYSTEM = """\
-You categorise a page from a hotel or homestay website.
+You categorise a page from a hotel or homestay's own documents.
 
 Pick the single category that best describes what the page is FOR. A rooms page \
 that mentions breakfast is still "rooms".
@@ -94,7 +94,15 @@ async def classify_document(
     The model is asked in two cases: the heuristics could not place the page,
     or the page looks like it describes rooms and a unit name is worth
     extracting. Everything else - policies, dining, directions, contact - is
-    settled for free. Without this, a 300-page crawl makes 300 billed calls.
+    settled for free. Without this, a 300-page document set makes 300 billed
+    calls.
+
+    When the heuristic already placed the page, the model is answering a
+    narrower question than it thinks: only `unit` is taken from it. It once
+    supplied the category as well, and relabelled `02-rooms-and-rate-card` from
+    `rates` to `rooms` - defensible in isolation, except it left the corpus
+    with no `rates` Source at all. A title matched by an explicit rule is the
+    stronger evidence; the model is here for the name it can read off the page.
     """
     guess = classify_heuristic(doc)
 
@@ -124,11 +132,13 @@ async def classify_document(
         )
         data = json.loads(result.text)
         raw = data.get("category", "other")
-        category = DocCategory(raw) if raw in set(DocCategory) else (guess or DocCategory.OTHER)
+        model_category = DocCategory(raw) if raw in set(DocCategory) else DocCategory.OTHER
         unit = (data.get("unit") or "").strip() or None
-        return category, unit
+        return guess or model_category, unit
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "classify.failed", uri=doc.uri, error=f"{type(exc).__name__}: {exc}"
+            "Classifier call failed; falling back to the title heuristic.",
+            uri=doc.uri,
+            error=f"{type(exc).__name__}: {exc}",
         )
         return guess or DocCategory.OTHER, None

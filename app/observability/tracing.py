@@ -22,8 +22,31 @@ from typing import Any
 import structlog
 
 from app.logging_setup import get_logger
+from app.observability.logfire_setup import exported_span
 
 log = get_logger(__name__)
+
+
+# How a step is announced in the terminal. A step with no entry here still
+# runs and still exports - it just prints under its raw name.
+STEPS: dict[str, tuple[str, str]] = {
+    # answer path, in the order it runs
+    "ask": ("💬", "Question"),
+    "intent": ("🧭", "Intent"),
+    "plan_query": ("🧠", "Planner Decision"),
+    "retrieve": ("🔎", "Vector Search"),
+    "rerank": ("🎯", "Reranking"),
+    "generate": ("✍️", "Answer Generation"),
+    "verify_grounding": ("✅", "Grounding Check"),
+    # ingestion, in the order it runs
+    "ingest": ("📥", "Ingest"),
+    "prepare_index": ("🗂️", "Collection Check"),
+    "load": ("📄", "Document Load"),
+    "classify": ("🏷️", "Classification"),
+    "chunk": ("✂️", "Chunking"),
+    "embed": ("🧮", "Embedding"),
+    "index": ("📚", "Indexing"),
+}
 
 
 @dataclass
@@ -33,6 +56,10 @@ class Span:
     duration_ms: float | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # One sentence, set by the body, saying what the step actually did:
+    # "Reranked 40 candidates down to 4 documents." The attributes are for
+    # querying; this is for reading.
+    summary: str = ""
 
 
 @dataclass
@@ -101,11 +128,37 @@ def span(name: str, **attributes: Any):
     trace = _current.get()
     if trace is not None:
         trace.spans.append(s)
-    try:
-        yield s
-    except Exception as exc:
-        s.error = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        s.duration_ms = round((time.perf_counter() - s.started_at) * 1000, 1)
-        log.debug("span", name=name, duration_ms=s.duration_ms, **s.attributes)
+    # The same step, twice over: appended to the in-process Trace that the
+    # /chat response and the admin metrics read, and opened as a Logfire span
+    # so the run is nested and timed in the UI. Ingestion has no Trace, which
+    # is why this is not conditional on one.
+    with exported_span(name, s.attributes) as exported:
+        try:
+            yield s
+        except Exception as exc:
+            s.error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            s.duration_ms = round((time.perf_counter() - s.started_at) * 1000, 1)
+            if exported is not None:
+                # Re-set: the body may have attached results mid-flight.
+                exported.set_attributes(s.attributes)
+            _announce(s)
+
+
+def _announce(s: Span) -> None:
+    """One line per completed step: icon, name, duration, what it did.
+
+    The step line is the readable spine of a run. Attributes still travel with
+    it, so nothing is lost to the terminal formatting - Logfire and a JSON
+    shipper both see every field.
+    """
+    icon, label = STEPS.get(s.name, ("·", s.name))
+    emit = log.error if s.error else log.info
+    emit(
+        s.error or s.summary,
+        icon=icon,
+        step=label,
+        ms=s.duration_ms,
+        **s.attributes,
+    )

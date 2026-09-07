@@ -23,8 +23,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from app.api import routes_admin, routes_chat
 from app.api.deps import build_gateway
 from app.config import get_settings
+from app.gateway.budget import get_usage_limiter
 from app.ingestion.pipeline import IngestionPipeline
 from app.logging_setup import configure_logging, get_logger
+from app.observability.logfire_setup import instrument_fastapi
 from app.pipeline.answer import AnswerPipeline
 from app.retrieval.embeddings import get_dense_embedder, get_sparse_encoder
 from app.retrieval.retriever import Retriever
@@ -38,10 +40,12 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, service="guide-api")
 
     db = await init_db(settings.database_path)
     repo = PropertyRepository(db)
+    # Counters live in the database so a restart cannot reset the day's budget.
+    get_usage_limiter(settings).attach(db)
 
     store = VectorStore(settings)
     dense = get_dense_embedder(settings)
@@ -49,6 +53,7 @@ async def lifespan(app: FastAPI):
     await store.ensure_collection(dense.dim)
 
     gateway = build_gateway(settings, repo)
+    gateway.preflight()
     retriever = Retriever(store, dense, sparse, top_k=settings.retrieve_top_k)
 
     app.state.settings = settings
@@ -60,6 +65,7 @@ async def lifespan(app: FastAPI):
         retriever=retriever,
         rerank_top_n=settings.rerank_top_n,
         min_rerank_score=settings.min_rerank_score,
+        min_rerank_relevance=settings.min_rerank_relevance,
     )
     app.state.ingestion = IngestionPipeline(
         settings=settings,
@@ -71,11 +77,15 @@ async def lifespan(app: FastAPI):
     )
 
     log.info(
-        "app.ready",
+        f"Ready. Answering with {settings.answer_model}, "
+        f"verifying with {settings.verifier_model}.",
         answer_model=settings.answer_model,
         verifier_model=settings.verifier_model,
         dense_model=settings.dense_model,
         dense_dim=settings.dense_dim,
+        run_spend_cap_usd=settings.run_spend_cap_usd or "unlimited",
+        account_spend_cap_usd=settings.account_daily_spend_cap_usd or "unlimited",
+        account_call_cap=settings.account_daily_call_cap or "unlimited",
     )
     try:
         yield
@@ -85,6 +95,11 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    # Before the app object exists: Logfire instruments FastAPI by adding
+    # middleware, and Starlette refuses new middleware once the app has
+    # started - which the lifespan already has.
+    configure_logging(get_settings().log_level, service="guide-api")
+
     app = FastAPI(
         title="Hotel AI Guide",
         version="0.1.0",
@@ -105,6 +120,7 @@ def create_app() -> FastAPI:
 
     app.include_router(routes_chat.router)
     app.include_router(routes_admin.router)
+    instrument_fastapi(app)
 
     @app.get("/health", tags=["ops"])
     async def health() -> JSONResponse:

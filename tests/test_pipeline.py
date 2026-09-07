@@ -46,12 +46,36 @@ class FakeResult:
 
 
 class FakeGateway:
-    """Returns a canned response per task. `calls` records what was asked."""
+    """Returns a canned response per task. `calls` records what was asked.
 
-    def __init__(self, *, answer: str = "Check-in is from 2pm [1].", grounded: bool = True):
+    `rerank_relevance` switches it to a dedicated reranker, the way pointing
+    RERANK_MODEL at rerank-v3.5 does in production.
+    """
+
+    def __init__(
+        self,
+        *,
+        answer: str = "Check-in is from 2pm [1].",
+        grounded: bool = True,
+        rerank_relevance: list[float] | None = None,
+    ):
         self._answer = answer
         self._grounded = grounded
+        self._relevance = rerank_relevance
         self.calls: list[str] = []
+
+    @property
+    def uses_dedicated_reranker(self) -> bool:
+        return self._relevance is not None
+
+    async def rerank(self, *, question, documents, top_n, property_id=None):
+        self.calls.append("rerank")
+        scores = [
+            (i, self._relevance[i] if i < len(self._relevance) else 0.0)
+            for i in range(len(documents))
+        ]
+        scores.sort(key=lambda pair: pair[1], reverse=True)
+        return scores[:top_n]
 
     async def complete(self, task, **kwargs):
         name = str(task)
@@ -61,7 +85,6 @@ class FakeGateway:
                 json.dumps(
                     {
                         "queries": ["check-in time"],
-                        "categories": [],
                         "unit_dependent": False,
                     }
                 )
@@ -86,10 +109,9 @@ class FakeGateway:
 class FakeRetriever:
     def __init__(self, chunks: list[ScoredChunk]) -> None:
         self._chunks = chunks
-        self.retried = False
 
-    async def retrieve_with_retry(self, property_id, plan, raw_question):
-        return list(self._chunks), self.retried
+    async def retrieve(self, property_id, plan, raw_question):
+        return list(self._chunks)
 
 
 def _chunk(
@@ -105,7 +127,7 @@ def _chunk(
             title="FAQ",
             heading_path=["Check-in"],
             category=DocCategory.POLICIES,
-            source_kind=SourceKind.WEBSITE,
+            source_kind=SourceKind.UPLOAD,
             position=0,
             token_estimate=20,
             unit=unit,
@@ -141,7 +163,12 @@ class TestAnswering:
         assert "2pm" in result.answer
 
     async def test_the_verifier_always_runs(self, prop: Property) -> None:
-        """The safety argument for a small answer model rests on this."""
+        """The safety argument for a small answer model rests on this.
+
+        "Always" means every answer a Visitor is shown. The one path that skips
+        the call deflects instead of showing anything - see
+        `test_deflects_when_the_answer_cites_nothing`.
+        """
         gateway = FakeGateway()
         pipeline = _pipeline(gateway, [_chunk("Check-in is from 2pm.")])
         await pipeline.answer(prop, "what time is check-in?")
@@ -173,6 +200,21 @@ class TestDeflection:
         assert not result.grounded
         assert "24 hours" not in result.answer
         assert "+44 1234 567890" in result.answer
+
+    async def test_deflects_when_the_answer_cites_nothing(self, prop: Property) -> None:
+        """An uncited answer claims nothing it is willing to stand behind, so
+        it is a non-answer however warmly it is phrased - and it must not be
+        shown on the strength of a verifier that was never asked."""
+        gateway = FakeGateway(
+            answer="I'm afraid the sources don't mention that. Do call the property."
+        )
+        pipeline = _pipeline(gateway, [_chunk("Check-in is from 2pm.")])
+        result = await pipeline.answer(prop, "is there parking?")
+
+        assert result.deflected
+        assert "do call the property" not in result.answer.lower()
+        assert "+44 1234 567890" in result.answer
+        assert "verify" not in gateway.calls, "an uncited answer costs no verifier call"
 
     async def test_deflects_on_prompt_injection(self, prop: Property) -> None:
         gateway = FakeGateway()
@@ -320,3 +362,57 @@ class TestHistoryRedactionReachesTheModel:
         )
         assert gateway.sent, "nothing was sent - test would pass vacuously"
         assert not any("4111" in blob for blob in gateway.sent)
+
+
+class TestDedicatedReranker:
+    """Cohere returns 0-1 relevance where the listwise LLM returns a 0-10
+    rubric score. Mixing the two scales up is the failure that matters: read a
+    relevance of 0.9 against a threshold of 4 and every answer becomes a
+    Deflection, silently and for every property at once."""
+
+    async def test_relevance_is_not_read_against_the_rubric_threshold(
+        self, prop: Property
+    ) -> None:
+        gateway = FakeGateway(rerank_relevance=[0.9])
+        pipeline = _pipeline(
+            gateway,
+            [_chunk("Check-in is from 2pm.")],
+            min_rerank_score=4,          # would reject 0.9 outright
+            min_rerank_relevance=0.2,
+        )
+        result = await pipeline.answer(prop, "what time is check-in?")
+
+        assert "rerank" in gateway.calls
+        assert not result.deflected
+        assert "2pm" in result.answer
+
+    async def test_passages_below_the_relevance_threshold_are_dropped(
+        self, prop: Property
+    ) -> None:
+        gateway = FakeGateway(rerank_relevance=[0.05])
+        pipeline = _pipeline(
+            gateway,
+            [_chunk("The garden was replanted in spring.")],
+            min_rerank_relevance=0.2,
+        )
+        result = await pipeline.answer(prop, "what time is check-in?")
+
+        # Nothing cleared the bar, so the Guide deflects rather than answering
+        # from a passage the reranker judged irrelevant.
+        assert result.deflected
+        assert "answer" not in gateway.calls
+
+    async def test_the_listwise_llm_is_not_called(self, prop: Property) -> None:
+        """The point of a dedicated reranker is that rerank stops being a chat
+        call - if it still is, the cost saving is imaginary."""
+        gateway = FakeGateway(rerank_relevance=[0.8, 0.7])
+        pipeline = _pipeline(
+            gateway,
+            [_chunk("Check-in is from 2pm."), _chunk("Check-out is 11am.")],
+        )
+        await pipeline.answer(prop, "what time is check-in?")
+
+        assert gateway.calls.count("rerank") == 1
+        # The listwise path would have gone through complete(Task.RERANK), which
+        # this fake records identically - so assert on what it was asked for.
+        assert gateway.calls == ["rewrite", "rerank", "answer", "verify"]

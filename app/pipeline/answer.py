@@ -3,8 +3,7 @@
 A fixed sequence, not an agent loop. With no tools to call and no actions to
 take, there is nothing for a planner to orchestrate - so the pipeline is:
 
-    screen -> plan -> retrieve (one conditional retry) -> rerank
-           -> answer -> verify -> cite
+    screen -> plan -> retrieve -> rerank -> answer -> verify -> cite
 
 Every stage can fail into a Deflection, which is a designed outcome rather than
 an error. Flat latency, one traceable path, and an eval harness that can score
@@ -29,7 +28,13 @@ from app.logging_setup import get_logger
 from app.models.domain import Citation, ScoredChunk
 from app.observability.metrics import METRICS
 from app.observability.tracing import current_trace_id, span
-from app.pipeline.prompts import build_answer_system, build_deflection, build_user_turn
+from app.pipeline.intent import Intent, classify_intent
+from app.pipeline.prompts import (
+    build_answer_system,
+    build_deflection,
+    build_smalltalk,
+    build_user_turn,
+)
 from app.retrieval.rerank import rerank
 from app.retrieval.retriever import Retriever, plan_query
 from app.storage.properties import Property
@@ -46,7 +51,6 @@ class AnswerResult:
     deflected: bool = False
     grounded: bool = True
     reason: str = ""
-    retried: bool = False
     trace_id: str = ""
     stages: dict[str, Any] = field(default_factory=dict)
 
@@ -59,11 +63,15 @@ class AnswerPipeline:
         retriever: Retriever,
         rerank_top_n: int = 8,
         min_rerank_score: int = 4,
+        min_rerank_relevance: float = 0.2,
     ) -> None:
         self._gateway = gateway
         self._retriever = retriever
         self._top_n = rerank_top_n
+        # Both thresholds are carried, and the reranking stage reads whichever
+        # matches the configured reranker's units.
         self._min_score = min_rerank_score
+        self._min_relevance = min_rerank_relevance
 
     # -- shared stages ---------------------------------------------------
 
@@ -83,7 +91,7 @@ class AnswerPipeline:
         message_verdict = check_message(question)
         if message_verdict.outcome is GuardOutcome.REJECT:
             METRICS.incr("pipeline.blocked", stage="message")
-            log.warning("pipeline.message_blocked", reason=message_verdict.reason)
+            log.warning("Question rejected by the input guard.", reason=message_verdict.reason)
             return (
                 question,
                 [],
@@ -100,7 +108,8 @@ class AnswerPipeline:
         history_verdict, history = check_history(history)
         if history_verdict.outcome is GuardOutcome.REJECT:
             METRICS.incr("pipeline.blocked", stage="history")
-            log.warning("pipeline.history_blocked", reason=history_verdict.reason)
+            log.warning("Conversation history rejected by the input guard.",
+                        reason=history_verdict.reason)
             return (
                 question,
                 [],
@@ -116,23 +125,47 @@ class AnswerPipeline:
 
         clean = message_verdict.message or question
 
+        # Before the planner, because a greeting should cost nothing: no
+        # rewrite call, no embedding, no vector search, no rerank.
+        with span("intent", question=clean[:120]) as s:
+            intent = classify_intent(clean)
+            s.attributes["intent"] = intent.value
+            s.summary = f"Read as {intent.value}."
+        if intent is not Intent.INFORMATIONAL:
+            METRICS.incr("pipeline.smalltalk", intent=intent.value)
+            return (
+                clean,
+                [],
+                "",
+                history,
+                AnswerResult(
+                    # Not a Deflection: nothing was asked and nothing failed.
+                    # It cites nothing because it claims nothing.
+                    answer=build_smalltalk(intent.value, prop.display_name),
+                    deflected=False,
+                    reason="",
+                    trace_id=current_trace_id(),
+                    stages={"intent": intent.value},
+                ),
+            )
+
         plan = await plan_query(
             clean, history, self._gateway, property_id=prop.property_id
         )
-        chunks, retried = await self._retriever.retrieve_with_retry(
-            prop.property_id, plan, clean
-        )
+        chunks = await self._retriever.retrieve(prop.property_id, plan, clean)
 
         if chunks:
-            chunks = await rerank(
-                clean,
-                chunks,
-                self._gateway,
-                top_n=self._top_n,
-                min_score=self._min_score,
-                property_id=prop.property_id,
+            # The planner's rewrites, not the raw question - see
+            # QueryPlan.rerank_query. `clean` stays the question the answer
+            # model is asked, which is the Visitor's own words.
+            chunks = await self._rerank(
+                plan.rerank_query() or clean, chunks, prop.property_id
             )
 
+        # Nothing survives reranking only when the Corpus genuinely has no
+        # answer: the search that produced these candidates saw every Chunk the
+        # Property has. There is no second pass to fall back to, which is the
+        # point - a Deflection here is a real gap rather than a bad guess.
         if not chunks:
             METRICS.incr("pipeline.deflected", stage="retrieval")
             return (
@@ -144,13 +177,25 @@ class AnswerPipeline:
                     answer=build_deflection(prop.display_name, contact),
                     deflected=True,
                     reason="nothing in the corpus answers this",
-                    retried=retried,
                     trace_id=current_trace_id(),
                 ),
             )
 
         context = sanitise_context(chunks)
         return clean, chunks, context, history, None
+
+    async def _rerank(
+        self, question: str, chunks: list[ScoredChunk], property_id: str
+    ) -> list[ScoredChunk]:
+        return await rerank(
+            question,
+            chunks,
+            self._gateway,
+            top_n=self._top_n,
+            min_score=self._min_score,
+            min_relevance=self._min_relevance,
+            property_id=property_id,
+        )
 
     def _messages(self, question: str, context: str, history: list[dict]) -> list[dict]:
         turns = [
@@ -175,13 +220,21 @@ class AnswerPipeline:
         contact = prop.contact_route.describe()
         system = build_answer_system(prop.display_name, contact)
 
-        with span("generate"):
+        with span("generate") as s:
             result = await self._gateway.complete(
                 Task.ANSWER,
                 system=system,
                 messages=self._messages(clean, context, history),
                 max_tokens=1200,
                 property_id=prop.property_id,
+            )
+            s.attributes["output_tokens"] = result.output_tokens
+            s.summary = (
+                f"Wrote an answer from {len(chunks)} "
+                f"source{'' if len(chunks) == 1 else 's'} "
+                f"({result.output_tokens} tokens)."
+                if not result.refused
+                else "The answer model declined to respond."
             )
 
         if result.refused or not result.text.strip():
@@ -190,6 +243,21 @@ class AnswerPipeline:
                 answer=build_deflection(prop.display_name, contact),
                 deflected=True,
                 reason="answer model declined or returned nothing",
+                trace_id=current_trace_id(),
+            )
+
+        # An answer that cites nothing claims nothing: the system prompt is
+        # explicit that a claim about the property must carry its [n]. So an
+        # uncited answer is a non-answer however warmly it is phrased, and it
+        # becomes a Deflection without a verifier call - which is both cheaper
+        # and safer than showing unverified prose, since the one thing that
+        # could be hiding in it is a claim the model chose not to cite.
+        if not build_citations(chunks, result.text):
+            METRICS.incr("pipeline.deflected", stage="uncited")
+            return AnswerResult(
+                answer=build_deflection(prop.display_name, contact),
+                deflected=True,
+                reason="the answer cited nothing",
                 trace_id=current_trace_id(),
             )
 
@@ -239,8 +307,15 @@ class AnswerPipeline:
             prop, question, history
         )
         if early is not None:
+            # The widget renders this as an ordinary reply; the flag is what
+            # distinguishes "we could not answer" from "nothing was asked",
+            # so it has to carry the result's own value rather than True.
             yield {"type": "deflect", "answer": early.answer, "reason": early.reason}
-            yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
+            yield {
+                "type": "done",
+                "trace_id": current_trace_id(),
+                "deflected": early.deflected,
+            }
             return
 
         system = build_answer_system(prop.display_name, contact)
@@ -257,7 +332,8 @@ class AnswerPipeline:
                 yield {"type": "token", "text": token}
         except Exception as exc:  # noqa: BLE001
             METRICS.incr("pipeline.stream_failed")
-            log.error("pipeline.stream_failed", error=f"{type(exc).__name__}: {exc}")
+            log.error("Answer generation failed mid-stream; retracting.",
+                      error=f"{type(exc).__name__}: {exc}")
             yield {
                 "type": "retract",
                 "answer": build_deflection(prop.display_name, contact),
@@ -272,6 +348,17 @@ class AnswerPipeline:
                 "type": "retract",
                 "answer": build_deflection(prop.display_name, contact),
                 "reason": "empty answer",
+            }
+            yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
+            return
+
+        # Same rule as the non-streaming path: uncited is a non-answer.
+        if not build_citations(chunks, text):
+            METRICS.incr("pipeline.deflected", stage="uncited")
+            yield {
+                "type": "retract",
+                "answer": build_deflection(prop.display_name, contact),
+                "reason": "the answer cited nothing",
             }
             yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
             return

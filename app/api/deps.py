@@ -4,7 +4,7 @@ Every chat request is anonymous and arrives from a public page, so admission is
 the only thing standing between a client's budget and the open internet. Three
 checks, cheapest first:
 
-    origin allowlist  ->  per-IP rate limit  ->  daily spend cap
+    origin allowlist  ->  per-IP rate limit  ->  property cap  ->  account cap
 
 The Origin header both authenticates and identifies: the widget never sends a
 property id it chose itself, because a caller who can pick the property id can
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from fastapi import Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
+from app.gateway.budget import UsageExceeded, get_usage_limiter
 from app.gateway.llm_gateway import LLMGateway
 from app.observability.metrics import METRICS
 from app.storage.db import get_db
@@ -156,6 +157,19 @@ async def resolve_property(
             headers={"Retry-After": "3600", "X-Spend-Today": f"{spent:.4f}"},
         )
 
+    # The account cap would stop this turn inside the gateway anyway; refusing
+    # at admission turns a mid-stream exception into a clean 429.
+    try:
+        await get_usage_limiter(settings).check("chat")
+    except UsageExceeded as exc:
+        METRICS.incr("admission.rejected", reason="account_cap")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="This assistant has reached its daily limit. Please contact the "
+            "property directly.",
+            headers={"Retry-After": "3600"},
+        ) from exc
+
     return prop
 
 
@@ -169,7 +183,7 @@ async def require_admin(
 
     Operator-only, never reachable from the widget. The placeholder key is
     rejected outright: a deployment that forgot to set ADMIN_API_KEY would
-    otherwise expose crawl, upload and delete behind a value published in
+    otherwise expose upload and delete behind a value published in
     .env.example.
     """
     settings = get_settings()

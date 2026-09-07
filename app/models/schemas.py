@@ -71,17 +71,9 @@ class PropertyOut(BaseModel):
     allowed_origins: list[str]
     daily_spend_cap_usd: float
     spent_today_usd: float
-    last_crawled_at: str | None
+    last_ingested_at: str | None
     active: bool
     indexed_chunks: int | None = None
-
-
-class CrawlRequest(BaseModel):
-    start_url: str
-    max_pages: int | None = Field(default=None, ge=1, le=2000)
-    max_depth: int | None = Field(default=None, ge=1, le=10)
-    include_paths: list[str] = Field(default_factory=list)
-    exclude_paths: list[str] = Field(default_factory=list)
 
 
 class IngestSummary(BaseModel):
@@ -91,16 +83,6 @@ class IngestSummary(BaseModel):
     skipped_unchanged: int
     errors: list[str] = Field(default_factory=list)
     duration_seconds: float
-
-
-class DriftReportOut(BaseModel):
-    property_id: str
-    checked: int
-    changed: list[str]
-    unreachable: list[str]
-    is_stale: bool
-    summary: str
-    checked_at: str
 
 
 class FeedbackRequest(BaseModel):

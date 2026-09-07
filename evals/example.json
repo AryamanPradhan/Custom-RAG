@@ -24,7 +24,7 @@
       "case_id": "phrasing-mismatch",
       "question": "is there anywhere to leave the car",
       "expects_source": "/amenities",
-      "note": "Visitor wording vs website wording ('parking'). Exercises the query planner."
+      "note": "Visitor wording vs the wording in the property's own documents ('parking'). Exercises the query planner."
     },
     {
       "case_id": "not-in-corpus",

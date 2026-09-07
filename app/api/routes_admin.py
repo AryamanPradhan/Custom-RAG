@@ -1,9 +1,8 @@
-"""Operator surface: onboarding, ingestion, drift, metrics.
+"""Operator surface: onboarding, ingestion, metrics.
 
 Admin-key guarded and never reachable from the widget. Ingestion runs inline
-rather than in a task queue - a crawl of a property site takes a couple of
-minutes, this is operated by hand, and a queue would be infrastructure with no
-second user.
+rather than in a task queue - a document takes seconds to index, this is
+operated by hand, and a queue would be infrastructure with no second user.
 """
 
 from __future__ import annotations
@@ -12,15 +11,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
 from app.api.deps import get_repo, require_admin
 from app.config import get_settings
-from app.ingestion.drift import check_drift
+from app.gateway.budget import get_usage_limiter
 from app.logging_setup import get_logger
-from app.models.schemas import (
-    CrawlRequest,
-    DriftReportOut,
-    IngestSummary,
-    PropertyIn,
-    PropertyOut,
-)
+from app.models.schemas import IngestSummary, PropertyIn, PropertyOut
 from app.observability.metrics import METRICS
 from app.storage.db import get_db
 from app.storage.properties import ContactRoute
@@ -37,7 +30,7 @@ async def _to_out(prop, indexed: int | None = None) -> PropertyOut:
         allowed_origins=prop.allowed_origins,
         daily_spend_cap_usd=prop.daily_spend_cap_usd,
         spent_today_usd=round(await repo.spent_today(prop.property_id), 4),
-        last_crawled_at=prop.last_crawled_at,
+        last_ingested_at=prop.last_ingested_at,
         active=prop.active,
         indexed_chunks=indexed,
     )
@@ -57,7 +50,7 @@ async def create_property(payload: PropertyIn) -> PropertyOut:
         daily_spend_cap_usd=payload.daily_spend_cap_usd,
     )
     log.info(
-        "property.created",
+        f"Registered {prop.property_id} ({prop.display_name}).",
         property_id=prop.property_id,
         origins=prop.allowed_origins,
     )
@@ -85,28 +78,10 @@ async def delete_property_corpus(property_id: str, request: Request) -> None:
     db = get_db()
     await db.conn.execute("DELETE FROM source_state WHERE property_id = ?", (property_id,))
     await db.conn.commit()
-    log.warning("property.corpus_deleted", property_id=property_id)
+    log.warning(f"Deleted the whole corpus for {property_id}.", property_id=property_id)
 
 
 # -- ingestion -------------------------------------------------------------
-
-
-@router.post("/properties/{property_id}/crawl", response_model=IngestSummary)
-async def crawl(property_id: str, payload: CrawlRequest, request: Request) -> IngestSummary:
-    repo = get_repo()
-    if await repo.get(property_id) is None:
-        raise HTTPException(404, "Register the property before ingesting.")
-
-    report = await request.app.state.ingestion.ingest_site(
-        property_id,
-        payload.start_url,
-        max_pages=payload.max_pages,
-        max_depth=payload.max_depth,
-        include_paths=payload.include_paths,
-        exclude_paths=payload.exclude_paths,
-    )
-    await repo.mark_crawled(property_id)
-    return IngestSummary(**report.__dict__)
 
 
 @router.post("/properties/{property_id}/upload", response_model=IngestSummary)
@@ -138,30 +113,8 @@ async def upload(
     )
     if report.errors and report.chunks == 0:
         raise HTTPException(422, "; ".join(report.errors))
-    await repo.mark_crawled(property_id)
+    await repo.mark_ingested(property_id)
     return IngestSummary(**report.__dict__)
-
-
-# -- drift -----------------------------------------------------------------
-
-
-@router.post("/properties/{property_id}/drift", response_model=DriftReportOut)
-async def drift(property_id: str) -> DriftReportOut:
-    """Re-fetch indexed pages and report which changed.
-
-    Embeds nothing. This is the cheap signal that a manually-refreshed corpus
-    has fallen behind the live site.
-    """
-    report = await check_drift(get_db(), get_settings(), property_id)
-    return DriftReportOut(
-        property_id=report.property_id,
-        checked=report.checked,
-        changed=report.changed,
-        unreachable=report.unreachable,
-        is_stale=report.is_stale,
-        summary=report.summary(),
-        checked_at=report.checked_at,
-    )
 
 
 # -- observability ---------------------------------------------------------
@@ -169,4 +122,5 @@ async def drift(property_id: str) -> DriftReportOut:
 
 @router.get("/metrics")
 async def metrics() -> dict:
-    return METRICS.snapshot()
+    """Counters plus today's account usage against its caps."""
+    return {**METRICS.snapshot(), "usage": get_usage_limiter().snapshot()}

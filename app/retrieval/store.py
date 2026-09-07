@@ -4,6 +4,12 @@ One collection, two named vectors per point, server-side RRF fusion. Multi-
 tenancy is a mandatory payload filter on property_id, indexed as a tenant key
 so Qdrant co-locates each property's points on disk.
 
+QDRANT_URL selects the backend. An http(s) URL talks to a server - Docker
+locally, or a managed cluster. Anything else is read as an embedded store: a
+directory path, or ":memory:" for a scratch one that dies with the process.
+Embedded runs the same query path in-process with no server at all, which is
+what makes a first upload testable before any infrastructure exists.
+
 Tenant isolation is enforced here rather than by the caller: search() takes
 property_id as a required positional argument, so there is no code path that
 can accidentally query across properties.
@@ -29,18 +35,34 @@ _NAMESPACE = uuid.UUID("6f1b0b1e-9f0f-4f7a-9a2f-2c9a0f3e5d11")
 
 def point_id(chunk_id: str) -> str:
     """Qdrant point IDs must be UUIDs or unsigned ints; our chunk ids are hex
-    strings. A deterministic uuid5 keeps upserts idempotent across re-crawls."""
+    strings. A deterministic uuid5 keeps upserts idempotent across re-uploads."""
     return str(uuid.uuid5(_NAMESPACE, chunk_id))
 
 
 class VectorStore:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self._client = AsyncQdrantClient(
-            url=self.settings.qdrant_url,
-            api_key=self.settings.qdrant_api_key or None,
-            timeout=30,
-        )
+        target = self.settings.qdrant_url
+        self.embedded = not target.startswith(("http://", "https://"))
+        if self.embedded:
+            # One process only - the store takes a lock on the directory - and
+            # payload indexes are ignored, so it is for development, not for
+            # serving. It is a real Qdrant otherwise: same client, same query
+            # path, same fusion.
+            self._client = AsyncQdrantClient(
+                path=None if target == ":memory:" else target,
+                location=":memory:" if target == ":memory:" else None,
+            )
+            log.warning(
+                f"Embedded Qdrant at {target} - single process, no payload indexes.",
+                location=target,
+            )
+        else:
+            self._client = AsyncQdrantClient(
+                url=target,
+                api_key=self.settings.qdrant_api_key or None,
+                timeout=30,
+            )
         self.collection = self.settings.qdrant_collection
 
     @property
@@ -66,7 +88,11 @@ class VectorStore:
                     SPARSE: models.SparseVectorParams(modifier=models.Modifier.IDF)
                 },
             )
-            log.info("store.collection_created", collection=self.collection, dim=dense_dim)
+            log.info(
+                f"Created collection {self.collection} ({dense_dim}-dim).",
+                collection=self.collection,
+                dim=dense_dim,
+            )
 
         # Payload indexes. property_id is declared as a tenant key so Qdrant
         # groups each tenant's vectors together - a large win once you host
@@ -74,6 +100,11 @@ class VectorStore:
         # Index creation is not idempotent across all Qdrant versions, and
         # ensure_collection() runs on every boot - so tolerate "already exists"
         # rather than crash-looping the service on restart.
+        if self.embedded:
+            # Embedded Qdrant ignores payload indexes and warns about each one.
+            # Nothing to create, so do not ask.
+            return
+
         async def _index(field: str, schema) -> None:
             try:
                 await self._client.create_payload_index(
@@ -116,7 +147,7 @@ class VectorStore:
         return len(points)
 
     async def delete_document(self, property_id: str, doc_id: str) -> None:
-        """Remove a document's chunks - used when a crawled page 404s or its
+        """Remove a document's chunks - used when a document is replaced or its
         content changed and produced fewer chunks than the previous run."""
         await self._client.delete(
             self.collection,
@@ -153,22 +184,21 @@ class VectorStore:
 
     # -- reads -----------------------------------------------------------
 
-    def _filter(
-        self, property_id: str, categories: list[DocCategory] | None
-    ) -> models.Filter:
-        must: list[models.Condition] = [
-            models.FieldCondition(
-                key="property_id", match=models.MatchValue(value=property_id)
-            )
-        ]
-        if categories:
-            must.append(
+    def _filter(self, property_id: str) -> models.Filter:
+        """Tenant isolation, and nothing else.
+
+        Category once narrowed this too. It no longer does: a filter chosen
+        before retrieval can only remove Chunks, and the ones it removed were
+        sometimes the answer. Relevance is decided by the reranker, which has
+        read the candidates. See ADR 0005.
+        """
+        return models.Filter(
+            must=[
                 models.FieldCondition(
-                    key="category",
-                    match=models.MatchAny(any=[str(c) for c in categories]),
+                    key="property_id", match=models.MatchValue(value=property_id)
                 )
-            )
-        return models.Filter(must=must)
+            ]
+        )
 
     async def hybrid_search(
         self,
@@ -177,7 +207,6 @@ class VectorStore:
         dense_vector: list[float],
         sparse_vector: tuple[list[int], list[float]],
         limit: int = 40,
-        categories: list[DocCategory] | None = None,
         prefetch_multiplier: int = 3,
     ) -> list[ScoredChunk]:
         """Dense + BM25 in one round trip, fused server-side with RRF.
@@ -186,7 +215,7 @@ class VectorStore:
         combine a cosine similarity with a BM25 score - two quantities that are
         not on remotely the same scale.
         """
-        query_filter = self._filter(property_id, categories)
+        query_filter = self._filter(property_id)
         prefetch_limit = limit * prefetch_multiplier
 
         response = await self._client.query_points(
@@ -216,7 +245,7 @@ class VectorStore:
     async def count(self, property_id: str) -> int:
         result = await self._client.count(
             self.collection,
-            count_filter=self._filter(property_id, None),
+            count_filter=self._filter(property_id),
             exact=True,
         )
         return result.count
@@ -229,7 +258,7 @@ class VectorStore:
         while True:
             points, offset = await self._client.scroll(
                 self.collection,
-                scroll_filter=self._filter(property_id, None),
+                scroll_filter=self._filter(property_id),
                 limit=512,
                 offset=offset,
                 with_payload=["doc_id", "content_hash"],
@@ -255,7 +284,7 @@ def _to_scored(point) -> ScoredChunk:
         title=payload.get("title", ""),
         heading_path=payload.get("heading_path", []) or [],
         category=DocCategory(payload.get("category", "other")),
-        source_kind=SourceKind(payload.get("source_kind", "website")),
+        source_kind=SourceKind(payload.get("source_kind", "upload")),
         position=payload.get("position", 0),
         token_estimate=len(payload.get("text", "")) // 4,
         unit=payload.get("unit"),

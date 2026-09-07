@@ -1,8 +1,9 @@
 """Layer 03 - Document loaders for owner uploads.
 
-Hotels keep the most valuable content in exactly the formats a crawler cannot
-reach: the rate card PDF, the house-rules DOCX, the breakfast menu. These are
-usually higher-trust than the marketing site, and the pipeline treats them so.
+The only way content enters a Corpus. Hotels keep what matters in exactly these
+formats - the rate card PDF, the house-rules DOCX, the breakfast menu - and
+they are higher-trust than a marketing site precisely because someone chose to
+hand each one over.
 """
 
 from __future__ import annotations

@@ -115,26 +115,33 @@ async def verify_grounding(
             )
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             METRICS.incr("guard.verifier_unparseable")
-            log.error("guard.verifier_unparseable", error=str(exc))
+            log.error("Verifier returned unusable output; blocking the answer.",
+                      error=str(exc))
             return GroundingVerdict(
                 grounded=False, checked=False, detail=f"verifier returned unusable output: {exc}"
             )
         except Exception as exc:  # noqa: BLE001 - provider-specific failures
             METRICS.incr("guard.verifier_failed")
-            log.error("guard.verifier_failed", error=f"{type(exc).__name__}: {exc}")
+            log.error("Verifier call failed; blocking the answer.",
+                      error=f"{type(exc).__name__}: {exc}")
             return GroundingVerdict(
                 grounded=False, checked=False, detail=f"verifier unavailable: {exc}"
             )
 
         s.attributes["grounded"] = verdict.grounded
         s.attributes["unsupported"] = len(verdict.unsupported_claims)
+        s.summary = (
+            "Every claim is supported by the sources."
+            if verdict.grounded
+            else f"{len(verdict.unsupported_claims)} claims are unsupported; answer blocked."
+        )
 
     METRICS.incr(
         "guard.grounding_pass" if verdict.grounded else "guard.grounding_fail"
     )
     if not verdict.grounded:
         log.warning(
-            "guard.ungrounded_answer",
+            "Answer was not supported by its sources; deflecting instead.",
             property_id=property_id,
             claims=verdict.unsupported_claims[:5],
         )

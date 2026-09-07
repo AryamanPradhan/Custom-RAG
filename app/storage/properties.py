@@ -1,7 +1,7 @@
 """Property registry and spend ledger (Layer 02 / 09).
 
 A Property's six config fields: display name, allowed origins, contact route
-for Deflections, daily spend cap, last-crawl timestamp, active flag. None of
+for Deflections, daily spend cap, last-ingest timestamp, active flag. None of
 these can come from ingestion - they are facts about the client, not about the
 hotel.
 """
@@ -85,7 +85,7 @@ class Property:
     display_name: str
     contact_route: ContactRoute = field(default_factory=ContactRoute)
     daily_spend_cap_usd: float = 5.0
-    last_crawled_at: str | None = None
+    last_ingested_at: str | None = None
     active: bool = True
     allowed_origins: list[str] = field(default_factory=list)
 
@@ -180,9 +180,9 @@ class PropertyRepository:
                 out.append(prop)
         return out
 
-    async def mark_crawled(self, property_id: str) -> None:
+    async def mark_ingested(self, property_id: str) -> None:
         await self._db.conn.execute(
-            "UPDATE properties SET last_crawled_at = ? WHERE property_id = ?",
+            "UPDATE properties SET last_ingested_at = ? WHERE property_id = ?",
             (datetime.now(UTC).isoformat(), property_id),
         )
         await self._db.conn.commit()
@@ -231,7 +231,7 @@ def _row_to_property(row, origins: list[str]) -> Property:
         display_name=row["display_name"],
         contact_route=ContactRoute.from_json(row["contact_route"]),
         daily_spend_cap_usd=float(row["daily_spend_cap_usd"]),
-        last_crawled_at=row["last_crawled_at"],
+        last_ingested_at=row["last_ingested_at"],
         active=bool(row["active"]),
         allowed_origins=origins,
     )

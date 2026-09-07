@@ -40,6 +40,41 @@ _INJECTION_RULES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     (
+        # "forget your system prompt", "ignore your instructions" - the same
+        # attack as override_instructions, minus the "previous" that rule
+        # hinges on. It is the most natural phrasing of the attack and it
+        # walked straight past this layer, reaching a Deflection six seconds
+        # and one verifier call later instead of in 9ms.
+        #
+        # The target has to be the Guide's own configuration. Bare "rules" is
+        # deliberately absent: a Visitor asking whether they can ignore your
+        # rules is asking about the house rules, and refusing them an answer
+        # costs more than letting a weak attempt through to a model that is
+        # separately told to answer only from its sources.
+        "override_own_instructions",
+        re.compile(
+            r"\b(ignore|disregard|override|bypass|forget|reset|erase|drop)\b"
+            r"[^.\n]{0,30}?"
+            r"(\byour\b[^.\n]{0,20}?\b(system\s+)?"
+            r"(prompt|instructions?|guidelines?|directives?|programming"
+            r"|configuration|training)\b"
+            r"|\bsystem (prompt|message)\b)",
+            re.I,
+        ),
+    ),
+    (
+        # "New instructions: ..." - a forged operator turn that never bothers
+        # with the "system:" header role_marker looks for. Narrow on purpose:
+        # "new rules:" is a plausible heading in a property's own house-rules
+        # document, and this list also runs over retrieved Chunks.
+        "injected_instructions",
+        re.compile(
+            r"^[ \t]*(new|updated|revised|additional|override)\s+"
+            r"(instructions?|prompt|directives?)\s*:",
+            re.I | re.M,
+        ),
+    ),
+    (
         # persona hijack
         "persona_override",
         re.compile(

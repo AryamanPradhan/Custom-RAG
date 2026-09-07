@@ -13,10 +13,14 @@ from enum import StrEnum
 
 
 class SourceKind(StrEnum):
-    """Where a document came from. Drives trust level and refresh policy."""
+    """Where a document came from. Drives trust level and refresh policy.
 
-    WEBSITE = "website"      # crawled from the property's own site
-    UPLOAD = "upload"        # PDF/DOCX the owner uploaded
+    Both kinds are supplied by the property owner. Nothing is fetched from the
+    open web, so the Guide can only ever answer from material someone chose to
+    hand over.
+    """
+
+    UPLOAD = "upload"          # PDF/DOCX/MD/HTML the owner uploaded
     STRUCTURED = "structured"  # PMS / rate feed, injected as text
 
 
@@ -41,7 +45,7 @@ class Document:
 
     property_id: str
     source_kind: SourceKind
-    uri: str                       # URL or upload://<filename>
+    uri: str                       # upload://<filename>, or a feed's own id
     title: str
     text: str
     category: DocCategory = DocCategory.OTHER
@@ -78,8 +82,9 @@ class Chunk:
     position: int
     token_estimate: int
     unit: str | None = None
-    # When the Source was last fetched. Shown to the Visitor as "as published
-    # on ..." because re-crawls are manual and a corpus can lag the live site.
+    # When the Source was ingested. Shown to the Visitor as "as published
+    # on ..." because a Corpus only changes when the owner sends new material,
+    # so it can lag what the property actually does today.
     fetched_at: str = ""
     metadata: dict = field(default_factory=dict)
 

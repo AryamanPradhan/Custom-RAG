@@ -23,7 +23,7 @@ from app.models.domain import DocCategory, Document, SourceKind
 def _doc(text: str, uri: str = "https://casaverde.com/rooms", title: str = "Rooms") -> Document:
     return Document(
         property_id="casa-verde",
-        source_kind=SourceKind.WEBSITE,
+        source_kind=SourceKind.UPLOAD,
         uri=uri,
         title=title,
         text=text,
@@ -92,7 +92,7 @@ class TestChunking:
         assert chunk.metadata["content_hash"]
 
     def test_chunk_ids_are_stable_across_runs(self) -> None:
-        """Re-crawling an unchanged page must upsert onto the same points, not
+        """Re-uploading an unchanged document must upsert onto the same points, not
         duplicate the corpus."""
         text = "# Rooms\n\nSleeps 2."
         first = chunk_document(_doc(text))
@@ -166,20 +166,39 @@ class TestCostAccounting:
         cached = cost_usd("claude-haiku-4-5", cache_read_tokens=1_000_000)
         assert cached == pytest.approx(fresh * 0.1)
 
+    def test_cache_discount_is_per_vendor(self) -> None:
+        """OpenAI reads cache at half price, not Anthropic's tenth. Sharing one
+        multiplier would under-report the spend that the daily cap counts."""
+        fresh = cost_usd("gpt-4o-mini", input_tokens=1_000_000)
+        cached = cost_usd("gpt-4o-mini", cache_read_tokens=1_000_000)
+        assert cached == pytest.approx(fresh * 0.5)
+        assert cost_usd("gpt-4o-mini", cache_write_tokens=1_000_000) == 0.0
+
     def test_unknown_model_raises_rather_than_billing_zero(self) -> None:
         """A silent fallback would make spend invisible to the daily cap."""
         with pytest.raises(UnknownModelError):
             cost_usd("some-new-model", input_tokens=1000)
 
+    def test_prices_a_unit_that_is_not_a_token(self) -> None:
+        """Cohere bills rerank per search unit, so a rerank of 40 passages
+        costs the same as a rerank of 4. Pricing it per token would have made
+        the reranker look free to the daily cap."""
+        assert cost_usd("rerank-v3.5", search_units=1) == pytest.approx(0.002)
+        assert cost_usd("rerank-v3.5", search_units=3) == pytest.approx(0.006)
+        # No token rate to fall back on: a token-only call must not bill zero
+        # silently *and* must not bill a token price it does not have.
+        assert cost_usd("rerank-v3.5", input_tokens=10_000) == 0.0
+
     def test_provider_routing(self) -> None:
         assert provider_for("gpt-4o-mini") == "openai"
         assert provider_for("claude-sonnet-5") == "anthropic"
+        assert provider_for("rerank-v3.5") == "cohere"
         assert provider_for("gemini-embedding-2") == "google"
 
 
 class TestClassificationCost:
     """Regression: the heuristic short-circuit was unreachable whenever a
-    gateway was wired in - which is always, in production. A 300-page crawl
+    gateway was wired in - which is always, in production. A 300-page upload
     made 300 billed calls."""
 
     async def test_settled_pages_skip_the_model(self) -> None:
@@ -211,3 +230,24 @@ class TestClassificationCost:
         assert gateway.calls == 1
         assert category is DocCategory.ROOMS
         assert unit == "The Barn"
+
+    async def test_the_unit_call_does_not_relabel_the_page(self) -> None:
+        """Regression: the model is asked for a unit name, and its category
+        came back with it. A rate card was relabelled `rooms`, which left the
+        corpus with no `rates` Source for a rates query to find."""
+
+        class RelabellingGateway:
+            async def complete(self, *a, **kw):
+                class R:
+                    text = '{"category": "rooms", "unit": null}'
+
+                return R()
+
+        doc = _doc(
+            "body",
+            uri="upload://02-rooms-and-rate-card-2026.pdf",
+            title="02 Rooms And Rate Card 2026",
+        )
+        category, unit = await classify_document(doc, RelabellingGateway())
+        assert category is DocCategory.RATES
+        assert unit is None

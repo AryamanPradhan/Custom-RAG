@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>The Glass Hotel — widget demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 42rem; margin: 4rem auto; padding: 0 1.5rem; color: #1a1a1a; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  p.sub { color: #666; margin-top: 0; }
+  code { background: #f2f2f2; padding: .1em .35em; border-radius: 3px; }
+  ul { color: #444; }
+</style>
+
+<h1>The Glass Hotel</h1>
+<p class="sub">Gangtok, Sikkim</p>
+
+<p>
+  A stand-in for a client's website. The only thing that matters here is the
+  <code>&lt;script&gt;</code> tag at the bottom — that is the whole integration.
+</p>
+
+<p>Questions the demo corpus can answer:</p>
+<ul>
+  <li>What time is check-in, and can I check in early?</li>
+  <li>Are dogs allowed?</li>
+  <li>What is the cancellation policy?</li>
+  <li>How do I get there from Bagdogra airport?</li>
+  <li>Is breakfast included?</li>
+</ul>
+<p>
+  And one it should refuse, because the answer is not in the corpus:
+  <em>"can you book me a table for tomorrow?"</em>
+</p>
+
+<!--
+  Served from http://localhost:5500, talking to the API on :8000. The Origin
+  header is what identifies the property, so :5500 must be registered:
+
+    guide onboard glass-hotel "The Glass Hotel" --origin http://localhost:5500
+-->
+<script src="http://localhost:8000/guide.js" data-property-id="glass-hotel"></script>

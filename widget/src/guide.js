@@ -128,7 +128,7 @@ class HotelGuide extends HTMLElement {
                autocomplete="off" aria-label="Your question" maxlength="1000" />
         <button class="send" type="submit">Send</button>
       </form>
-      <div class="disclaimer">Answers come from this property's website.</div>
+      <div class="disclaimer">Answers come from documents this property provided.</div>
     `;
     this.$panel.querySelector(".title").textContent = this._title;
 
@@ -189,7 +189,8 @@ class HotelGuide extends HTMLElement {
       link.rel = "noopener noreferrer";
       link.textContent = `[${c.index}] ${c.label}`;
       row.append(link);
-      // Re-crawls are manual, so the corpus can lag the live site. Showing
+      // A corpus only changes when the owner sends new material, so it can
+      // lag what the property does today. Showing
       // when a source was published is how a visitor can tell.
       if (c.published_on) {
         const stamp = document.createElement("span");

@@ -59,6 +59,33 @@ DEFLECTION_TEMPLATE = (
     "not guess. For this one, {contact_route}."
 )
 
+# Smalltalk replies. Written out rather than generated: they make no claim
+# about the property, so there is nothing for a model to add and nothing for
+# the verifier to check - and every one of them would otherwise cost a call.
+# Each ends by handing the turn back, because the visitor came to ask
+# something and the Guide's job is to make that easy, not to chat.
+SMALLTALK_TEMPLATES = {
+    "greeting": (
+        "Hi - I'm well, thank you. I'm here to help with anything you'd like to "
+        "know about {display_name}: rooms, dining, getting here, the spa, or "
+        "anything else in their guest information. What can I help you with?"
+    ),
+    "thanks": (
+        "You're very welcome. If anything else about {display_name} comes to "
+        "mind, just ask."
+    ),
+    "farewell": (
+        "Safe travels - and if anything else about {display_name} comes up, "
+        "I'm here."
+    ),
+    "capability": (
+        "I'm {display_name}'s assistant. I answer from their own published "
+        "information - rooms and rates, dining, the spa, getting here, and "
+        "their policies - and I'll tell you plainly when something isn't "
+        "covered rather than guess. What would you like to know?"
+    ),
+}
+
 STALE_NOTE = (
     "This is based on the website as published on {date}, so it's worth "
     "confirming if it's time-sensitive."
@@ -73,6 +100,11 @@ def build_deflection(display_name: str, contact_route: str) -> str:
     return DEFLECTION_TEMPLATE.format(
         display_name=display_name, contact_route=contact_route
     )
+
+
+def build_smalltalk(intent: str, display_name: str) -> str:
+    """The reply to a turn that asked nothing about the property."""
+    return SMALLTALK_TEMPLATES[intent].format(display_name=display_name)
 
 
 def build_user_turn(question: str, context: str) -> str:

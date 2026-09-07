@@ -11,17 +11,22 @@ Two things stand between a Visitor's question and a good set of Chunks:
 So the planner rewrites the question into several standalone search queries
 using the history, and every query is run through hybrid search before the
 results are fused.
+
+What the planner does not do is narrow the search. It once guessed a category
+per question and the search was filtered to it, which is a guess made before
+anything has been retrieved - and a wrong guess hides the one Source that
+answers the question. See ADR 0005.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.gateway.llm_gateway import LLMGateway, Task
 from app.logging_setup import get_logger
-from app.models.domain import DocCategory, ScoredChunk
+from app.models.domain import ScoredChunk
 from app.observability.metrics import METRICS
 from app.observability.tracing import span
 from app.retrieval.embeddings import GeminiEmbedder, SparseEncoder
@@ -56,17 +61,9 @@ _PLAN_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "1-3 standalone search queries",
             },
-            "categories": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": [str(c) for c in DocCategory],
-                },
-                "description": "content categories to prefer, or empty for all",
-            },
             "unit_dependent": {"type": "boolean"},
         },
-        "required": ["queries", "categories", "unit_dependent"],
+        "required": ["queries", "unit_dependent"],
         "additionalProperties": False,
     },
 }
@@ -75,15 +72,34 @@ _PLAN_SCHEMA = {
 @dataclass(slots=True)
 class QueryPlan:
     queries: list[str]
-    categories: list[DocCategory] = field(default_factory=list)
     unit_dependent: bool = False
+
+    def rerank_query(self) -> str:
+        """The information need as one string, for a stage that takes one query.
+
+        The rewrites rather than the Visitor's raw wording, because the two
+        stages want different things. Retrieval wants both: hybrid search
+        fuses several queries, and the original phrasing sometimes carries a
+        word the rewrite paraphrased away. Reranking takes a single query and
+        scores every candidate against it, so noise in that one string moves
+        every score at once.
+
+        A typo is the clearest case. "Is tehr free wifi" and "Is there free
+        wifi" plan identically - both rewrite to "free wifi availability" - and
+        retrieve the same Chunks in the same order, but scored against the
+        raw text the whole set drops roughly fourfold, from 0.2578 to 0.0626 at
+        the top, and falls through the relevance floor. The Corpus had the
+        answer, the planner had already repaired the question, and the Guide
+        deflected anyway.
+        """
+        return " ".join(self.queries)
 
     @classmethod
     def fallback(cls, question: str) -> QueryPlan:
         """Used when the planner is unavailable. Retrieval on the raw question
         is worse, but it is not nothing - and a planner outage should degrade
         the Guide, not take it down."""
-        return cls(queries=[question], categories=[], unit_dependent=False)
+        return cls(queries=[question], unit_dependent=False)
 
 
 async def plan_query(
@@ -119,9 +135,6 @@ async def plan_query(
             queries = [q for q in data.get("queries", []) if q.strip()][:3]
             plan = QueryPlan(
                 queries=queries or [question],
-                categories=[
-                    DocCategory(c) for c in data.get("categories", []) if c in set(DocCategory)
-                ],
                 unit_dependent=bool(data.get("unit_dependent", False)),
             )
         except Exception as exc:  # noqa: BLE001
@@ -131,6 +144,10 @@ async def plan_query(
 
         s.attributes["queries"] = plan.queries
         s.attributes["unit_dependent"] = plan.unit_dependent
+        s.summary = (
+            f"Rewrote the question into {len(plan.queries)} search "
+            f"{'query' if len(plan.queries) == 1 else 'queries'}."
+        )
     return plan
 
 
@@ -152,15 +169,13 @@ class Retriever:
         self,
         property_id: str,
         queries: list[str],
-        *,
-        categories: list[DocCategory] | None = None,
     ) -> list[ScoredChunk]:
         """Run every query through hybrid search and fuse the results."""
         if not queries:
             return []
 
         results = await asyncio.gather(
-            *(self._one(property_id, q, categories) for q in queries),
+            *(self._one(property_id, q) for q in queries),
             return_exceptions=True,
         )
 
@@ -184,12 +199,7 @@ class Retriever:
         ordered = sorted(fused.values(), key=lambda s: s.score, reverse=True)
         return ordered[: self._top_k]
 
-    async def _one(
-        self,
-        property_id: str,
-        query: str,
-        categories: list[DocCategory] | None,
-    ) -> list[ScoredChunk]:
+    async def _one(self, property_id: str, query: str) -> list[ScoredChunk]:
         dense_vector, sparse_vector = await asyncio.gather(
             self._dense.embed_query(query),
             self._sparse.encode_query(query),
@@ -199,35 +209,26 @@ class Retriever:
             dense_vector=dense_vector,
             sparse_vector=sparse_vector,
             limit=self._top_k,
-            categories=categories,
         )
 
-    async def retrieve_with_retry(
+    async def retrieve(
         self,
         property_id: str,
         plan: QueryPlan,
         raw_question: str,
-    ) -> tuple[list[ScoredChunk], bool]:
-        """The one conditional retry the pipeline allows.
+    ) -> list[ScoredChunk]:
+        """One pass over the whole Corpus.
 
-        The first pass is narrow: rewritten queries, filtered to the categories
-        the planner picked. When that comes back empty the usual cause is a bad
-        category guess, so the retry drops the filter and adds the Visitor's
-        own wording, which sometimes matches text the rewrite paraphrased away.
-
-        Returns (chunks, retried).
+        The Visitor's own wording rides along with the rewritten queries rather
+        than being held back for a retry. A rewrite is a paraphrase, and a
+        paraphrase can lose the one word the Source actually uses - so the
+        original phrasing is worth a query on every question, not only on the
+        ones that have already come back empty.
         """
+        queries = list(dict.fromkeys([*plan.queries, raw_question]))
         with span("retrieve") as s:
-            chunks = await self.search(property_id, plan.queries, categories=plan.categories)
+            chunks = await self.search(property_id, queries)
             s.attributes["hits"] = len(chunks)
-            s.attributes["filtered"] = bool(plan.categories)
-
-        if chunks:
-            return chunks, False
-
-        METRICS.incr("retrieval.retry")
-        with span("retrieve_retry") as s:
-            widened = list(dict.fromkeys([*plan.queries, raw_question]))
-            chunks = await self.search(property_id, widened, categories=None)
-            s.attributes["hits"] = len(chunks)
-        return chunks, True
+            s.attributes["queries"] = len(queries)
+            s.summary = f"Retrieved {len(chunks)} candidates from Qdrant."
+        return chunks

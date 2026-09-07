@@ -33,7 +33,8 @@ Everything the Guide is allowed to answer from, for one Property.
 _Avoid_: knowledge base, index, dataset
 
 **Source**:
-One artifact that went into the Corpus — a crawled page or an uploaded file.
+One artifact that went into the Corpus — always something the property owner
+supplied, never anything fetched from the open web.
 _Avoid_: document, page, file
 
 **Chunk**:

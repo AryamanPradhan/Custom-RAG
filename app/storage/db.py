@@ -1,7 +1,7 @@
 """SQLite schema and connection handling (Layer 09).
 
 SQLite rather than Postgres because the working set is tiny - roughly six
-fields per Property, a daily spend counter, one row per crawled Source, and
+fields per Property, a daily spend counter, one row per indexed Source, and
 eval results. What it buys over config files is that onboarding a client is an
 INSERT rather than a redeploy of the service every other client is being served
 by.
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS properties (
     display_name         TEXT NOT NULL,
     contact_route        TEXT,           -- JSON: {phone, email, url, note}
     daily_spend_cap_usd  REAL NOT NULL DEFAULT 5.0,
-    last_crawled_at      TEXT,
+    last_ingested_at     TEXT,
     created_at           TEXT NOT NULL,
     active               INTEGER NOT NULL DEFAULT 1
 );
@@ -49,18 +49,23 @@ CREATE TABLE IF NOT EXISTS spend_ledger (
     PRIMARY KEY (property_id, day)
 );
 
--- Drift detector state. Re-crawls are manual, so this is how a stale corpus
--- becomes visible without re-embedding anything.
+-- One row per indexed Source: which owner-supplied document is in the index,
+-- at which content hash, since when. Answers "what do you hold about us?"
+-- without reading the vector store back.
 CREATE TABLE IF NOT EXISTS source_state (
     property_id      TEXT NOT NULL REFERENCES properties(property_id) ON DELETE CASCADE,
     uri              TEXT NOT NULL,
     content_hash     TEXT NOT NULL,
-    etag             TEXT,
-    last_modified    TEXT,
     indexed_at       TEXT NOT NULL,
-    last_checked_at  TEXT,
-    drifted          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (property_id, uri)
+);
+
+-- Account-wide usage counters, one row per UTC day. Persisted so that
+-- restarting the process mid-session does not hand it a fresh budget.
+CREATE TABLE IF NOT EXISTS usage_ledger (
+    day        TEXT PRIMARY KEY,
+    calls      INTEGER NOT NULL DEFAULT 0,
+    spent_usd  REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS feedback (
@@ -97,8 +102,6 @@ CREATE TABLE IF NOT EXISTS eval_results (
     PRIMARY KEY (run_id, case_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_source_state_drift
-    ON source_state(property_id, drifted);
 CREATE INDEX IF NOT EXISTS idx_feedback_property
     ON feedback(property_id, created_at);
 """
@@ -115,7 +118,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
-        log.info("db.ready", path=self.path)
+        log.info(f"SQLite ready at {self.path}.", path=self.path)
 
     async def close(self) -> None:
         if self._conn is not None:

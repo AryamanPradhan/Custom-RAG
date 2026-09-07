@@ -40,6 +40,12 @@ class EvalCase:
     expects_source: str | None = None
     # True when the corpus genuinely cannot answer and deflecting is correct.
     expects_deflection: bool = False
+    # Substrings the answer must contain, matched case-insensitively. For the
+    # cases where "grounded" is not enough: an answer can stay inside its
+    # sources and still tell the visitor the opposite of what they needed,
+    # which is exactly what happens when a general rule is retrieved in place
+    # of the specific exception to it.
+    expects_answer_contains: list[str] = field(default_factory=list)
     note: str = ""
 
 
@@ -93,6 +99,7 @@ def load_cases(path: str | Path) -> list[EvalCase]:
             question=item["question"],
             expects_source=item.get("expects_source"),
             expects_deflection=bool(item.get("expects_deflection", False)),
+            expects_answer_contains=list(item.get("expects_answer_contains", []) or []),
             note=item.get("note", ""),
         )
         for i, item in enumerate(data.get("cases", []), start=1)
@@ -127,17 +134,32 @@ async def run_eval(
         hit = bool(case.expects_source and case.expects_source in cited)
 
         if case.expects_deflection:
-            passed = result.deflected
+            # A refusal the answer model writes itself - "I'm unable to make
+            # bookings; please contact the property" - does the same job as the
+            # pipeline's Deflection and should score the same. What the two
+            # have in common is citing nothing: an informational answer in this
+            # system always carries the sources it came from, so an uncited
+            # answer is a non-answer however it was phrased.
+            passed = result.deflected or not result.citations
             detail = "" if passed else "answered a question it should have deflected"
         elif result.deflected:
             passed = False
             detail = f"deflected unexpectedly: {result.reason}"
-        elif case.expects_source:
-            passed = hit and result.grounded
-            detail = "" if passed else f"expected a citation matching {case.expects_source!r}"
         else:
-            passed = result.grounded
-            detail = "" if passed else result.reason
+            lowered = result.answer.lower()
+            missing = [
+                phrase
+                for phrase in case.expects_answer_contains
+                if phrase.lower() not in lowered
+            ]
+            passed = result.grounded and not missing
+            detail = "" if passed else (result.reason or "")
+            if case.expects_source:
+                passed = passed and hit
+                if not hit:
+                    detail = f"expected a citation matching {case.expects_source!r}"
+            if missing:
+                detail = f"answer did not mention {missing!r}"
 
         run.results.append(
             CaseResult(
@@ -155,7 +177,10 @@ async def run_eval(
     if db is not None:
         await _persist(db, run)
 
-    log.info("eval.completed", **run.summary())
+    log.info(
+        f"Eval finished: {run.rate('passed'):.0%} passed of {len(run.results)} cases.",
+        **run.summary(),
+    )
     return run
 
 
