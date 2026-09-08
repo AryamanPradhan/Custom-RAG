@@ -22,7 +22,9 @@ from fastapi import Header, HTTPException, Request, status
 from app.config import Settings, get_settings
 from app.gateway.budget import UsageExceeded, get_usage_limiter
 from app.gateway.llm_gateway import LLMGateway
+from app.models.domain import TurnRecord
 from app.observability.metrics import METRICS
+from app.storage.chat_log import ChatLog
 from app.storage.db import get_db
 from app.storage.properties import Property, PropertyRepository
 
@@ -206,6 +208,15 @@ def make_spend_recorder(repo: PropertyRepository):
 
     async def record(property_id: str, amount_usd: float) -> None:
         await repo.record_spend(property_id, amount_usd)
+
+    return record
+
+
+def make_turn_recorder(chat_log: ChatLog):
+    """Bridges the pipeline's finished turns to the chat log."""
+
+    async def record(turn: TurnRecord) -> None:
+        await chat_log.record(turn)
 
     return record
 

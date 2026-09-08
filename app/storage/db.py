@@ -6,8 +6,10 @@ eval results. What it buys over config files is that onboarding a client is an
 INSERT rather than a redeploy of the service every other client is being served
 by.
 
-Conversations are deliberately absent. Sessions are stateless: the widget
-carries history, so there is no Visitor transcript here to retain or expire.
+Sessions are still stateless - the widget carries the history, and nothing
+here is read back into a prompt. `chat_log` is the one Visitor-facing table:
+a write-only record of what was asked and answered, kept for the operator and
+expired on a retention window rather than held indefinitely (ADR 0003).
 """
 
 from __future__ import annotations
@@ -78,6 +80,28 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at   TEXT NOT NULL
 );
 
+-- One row per completed turn. Written after the Visitor already has their
+-- answer, so a failure to log can never cost them one. The question is stored
+-- as the guardrails left it: PII is redacted before it lands here, the same
+-- text that went to the provider.
+CREATE TABLE IF NOT EXISTS chat_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id  TEXT NOT NULL,
+    session_id   TEXT,
+    trace_id     TEXT,
+    created_at   TEXT NOT NULL,
+    question     TEXT NOT NULL,
+    answer       TEXT NOT NULL,
+    mode         TEXT NOT NULL,          -- json | stream
+    intent       TEXT,
+    deflected    INTEGER NOT NULL DEFAULT 0,
+    grounded     INTEGER NOT NULL DEFAULT 1,
+    blocked      INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT,
+    citations    TEXT,                   -- JSON array of the cited sources
+    latency_ms   REAL
+);
+
 CREATE TABLE IF NOT EXISTS eval_runs (
     run_id           TEXT PRIMARY KEY,
     property_id      TEXT NOT NULL,
@@ -104,6 +128,13 @@ CREATE TABLE IF NOT EXISTS eval_results (
 
 CREATE INDEX IF NOT EXISTS idx_feedback_property
     ON feedback(property_id, created_at);
+
+-- Every read of the log is "this property, newest first", and the retention
+-- sweep scans on date alone.
+CREATE INDEX IF NOT EXISTS idx_chat_log_property
+    ON chat_log(property_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_log_created
+    ON chat_log(created_at);
 """
 
 

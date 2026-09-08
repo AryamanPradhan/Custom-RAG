@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     # ---- Relational storage ---------------------------------------------
     database_path: str = "data/guide.db"
 
+    # ---- Chat log (Layer 09) --------------------------------------------
+    # One row per served turn: what was asked, what was answered, why it
+    # deflected. Off makes the service keep nothing about a Visitor at all,
+    # which is the right setting for a client who asks for exactly that.
+    # Retention is a ceiling, not a promise of freshness: rows are swept at
+    # startup, so a service that never restarts never sweeps. 0 keeps forever.
+    chat_log_enabled: bool = True
+    chat_log_retention_days: int = 90
+
     # ---- Ingestion ------------------------------------------------------
     # Uploads are the only way content enters a Corpus.
     upload_dir: str = "data/uploads"

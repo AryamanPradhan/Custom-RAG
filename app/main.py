@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.api import routes_admin, routes_chat
-from app.api.deps import build_gateway
+from app.api.deps import build_gateway, make_turn_recorder
 from app.config import get_settings
 from app.gateway.budget import get_usage_limiter
 from app.ingestion.pipeline import IngestionPipeline
@@ -31,6 +31,7 @@ from app.pipeline.answer import AnswerPipeline
 from app.retrieval.embeddings import get_dense_embedder, get_sparse_encoder
 from app.retrieval.retriever import Retriever
 from app.retrieval.store import VectorStore
+from app.storage.chat_log import ChatLog
 from app.storage.db import close_db, init_db
 from app.storage.properties import PropertyRepository
 
@@ -56,13 +57,20 @@ async def lifespan(app: FastAPI):
     gateway.preflight()
     retriever = Retriever(store, dense, sparse, top_k=settings.retrieve_top_k)
 
+    chat_log = ChatLog(db)
+    if settings.chat_log_enabled:
+        # Retention has no scheduler behind it: a deploy is the sweep.
+        await chat_log.purge(settings.chat_log_retention_days)
+
     app.state.settings = settings
     app.state.store = store
     app.state.repo = repo
     app.state.gateway = gateway
+    app.state.chat_log = chat_log
     app.state.pipeline = AnswerPipeline(
         gateway=gateway,
         retriever=retriever,
+        on_turn=make_turn_recorder(chat_log) if settings.chat_log_enabled else None,
         rerank_top_n=settings.rerank_top_n,
         min_rerank_score=settings.min_rerank_score,
         min_rerank_relevance=settings.min_rerank_relevance,
@@ -83,6 +91,11 @@ async def lifespan(app: FastAPI):
         verifier_model=settings.verifier_model,
         dense_model=settings.dense_model,
         dense_dim=settings.dense_dim,
+        chat_log=(
+            f"{settings.chat_log_retention_days}d retention"
+            if settings.chat_log_enabled
+            else "off"
+        ),
         run_spend_cap_usd=settings.run_spend_cap_usd or "unlimited",
         account_spend_cap_usd=settings.account_daily_spend_cap_usd or "unlimited",
         account_call_cap=settings.account_daily_call_cap or "unlimited",

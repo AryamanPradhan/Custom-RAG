@@ -9,6 +9,7 @@ supplied, ask the Guide a question, run the eval set.
     guide upload casa-verde ./data/demo-corpus        # a folder works too
     guide ask casa-verde "can I bring my dog?"
     guide eval casa-verde ./evals/casa-verde.json
+    guide logs casa-verde --deflected        # what the corpus could not answer
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from app.pipeline.answer import AnswerPipeline
 from app.retrieval.embeddings import get_dense_embedder, get_sparse_encoder
 from app.retrieval.retriever import Retriever
 from app.retrieval.store import VectorStore
+from app.storage.chat_log import ChatLog
 from app.storage.db import close_db, init_db
 from app.storage.properties import ContactRoute, PropertyRepository
 
@@ -45,7 +47,14 @@ class _Context:
         self.sparse = sparse
         self.gateway = gateway
 
-    def answer_pipeline(self) -> AnswerPipeline:
+    def answer_pipeline(self, *, record_turns: bool = False) -> AnswerPipeline:
+        """`record_turns` files each turn in the chat log.
+
+        On for `ask`, which is a real question against a real Corpus, and off
+        for `eval`, which would otherwise file a sweep of invented questions
+        as though visitors had asked them.
+        """
+        chat_log = ChatLog(self.db)
         return AnswerPipeline(
             gateway=self.gateway,
             retriever=Retriever(
@@ -54,6 +63,11 @@ class _Context:
             rerank_top_n=self.settings.rerank_top_n,
             min_rerank_score=self.settings.min_rerank_score,
             min_rerank_relevance=self.settings.min_rerank_relevance,
+            on_turn=(
+                chat_log.record
+                if record_turns and self.settings.chat_log_enabled
+                else None
+            ),
         )
 
     def ingestion(self) -> IngestionPipeline:
@@ -179,7 +193,9 @@ async def _ask(args) -> int:
         # retrieve, rerank, generate, verify. Served requests get this from
         # the FastAPI instrumentation instead.
         with span("ask", question=args.question) as s:
-            result = await ctx.answer_pipeline().answer(prop, args.question)
+            result = await ctx.answer_pipeline(record_turns=True).answer(
+                prop, args.question
+            )
             s.summary = (
                 f"Deflected: {result.reason}."
                 if result.deflected
@@ -226,6 +242,38 @@ async def _eval(args) -> int:
         await close_db()
 
 
+async def _logs(args) -> int:
+    """Read the chat log back. No models, no vector store - just the table."""
+    ctx = await _build(need_embeddings=False)
+    try:
+        turns = await ChatLog(ctx.db).recent(
+            args.property_id,
+            limit=args.limit,
+            session_id=args.session,
+            deflected_only=args.deflected,
+        )
+        if not turns:
+            print("No turns recorded yet.")
+            return 0
+        for turn in turns:
+            mark = "✗" if turn["deflected"] else ("!" if turn["blocked"] else "✓")
+            stamp = turn["created_at"][:19].replace("T", " ")
+            print(f"\n{mark} {stamp}  {turn['mode']}  {turn['latency_ms']:.0f}ms")
+            print(f"   Q: {turn['question']}")
+            print(f"   A: {turn['answer'][:300]}")
+            if turn["reason"]:
+                print(f"   → {turn['reason']}")
+            for citation in turn["citations"]:
+                print(f"      [{citation['index']}] {citation['label']}")
+        print(f"\n{len(turns)} turn{'' if len(turns) == 1 else 's'}.")
+        return 0
+    finally:
+        # _build opens one either way, and an embedded Qdrant holds a
+        # lock on its directory until it is closed.
+        await ctx.store.close()
+        await close_db()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="guide", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -250,6 +298,14 @@ def main() -> int:
     p.add_argument("property_id")
     p.add_argument("question")
     p.set_defaults(func=_ask)
+
+    p = sub.add_parser("logs", help="read the chat log for a property")
+    p.add_argument("property_id")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--session", help="only this session id")
+    p.add_argument("--deflected", action="store_true",
+                   help="only turns the corpus could not answer")
+    p.set_defaults(func=_logs)
 
     p = sub.add_parser("eval", help="run an eval case file")
     p.add_argument("property_id")

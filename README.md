@@ -17,7 +17,7 @@ those stay with the existing booking engine, and the Guide points at it.
                   │  screen → plan → retrieve → rerank            │
                   │         → answer → verify → cite              │
                   └──────┬───────────────────────────────────────┘
-                    Qdrant (dense + BM25)   SQLite (config, spend, drift)
+                    Qdrant (dense + BM25)   SQLite (config, spend, chat log)
 ```
 
 ## How it answers
@@ -126,6 +126,37 @@ the answer stay inside its sources — the answer model overreaching), and
 **deflection** (did it decline when it should have). A Guide that answers
 everything scores well on groundedness right up until it invents a refund policy.
 
+## What gets recorded
+
+Every served turn lands in `chat_log`: the question, the answer, what it cited,
+how long it took, and — when it did not answer — why.
+
+```bash
+guide logs casa-verde --deflected     # only the turns the corpus could not answer
+```
+
+That flag is the point of the table. A deflection is a designed response to a
+gap, but a gap nobody can see is one nobody fixes, and five visitors a week
+asking about airport transfers is the signal to go ask the owner for that page.
+The rest of the log answers the other question a client eventually asks: what
+did the Guide tell my guest?
+
+Sessions are still stateless — nothing is read back out of this table, and the
+widget still carries the history the model sees ([ADR 0003](docs/adr/0003-stateless-sessions.md)).
+It holds visitor text, so:
+
+- The question is stored **as the guardrails left it** — a card number the PII
+  guard stripped before the prompt is `[redacted]` in the log too.
+- `CHAT_LOG_RETENTION_DAYS` (90 by default) bounds how long a row lives, swept
+  at startup. `CHAT_LOG_ENABLED=false` records nothing at all.
+- `DELETE /admin/properties/{id}/chats` erases transcripts on request —
+  separate from deleting the corpus, because those are different asks.
+- Nothing identifies a visitor beyond the `session_id` their widget generated.
+  No IP address is stored.
+
+Eval sweeps are deliberately not recorded: 22 invented questions filed as
+visitor conversations would poison the one table that says what real people ask.
+
 ## Watching it run
 
 A run reads as a timeline of steps — one line each, in the order they ran:
@@ -160,7 +191,7 @@ app/
   ingestion/    Layer 03 — load, classify, chunk, record what is indexed
   retrieval/    Layer 04 — embeddings, Qdrant hybrid store, rerank
   pipeline/     Layer 02 — the answer pipeline and its prompts
-  storage/      Layer 09 — SQLite: config, spend ledger, drift, eval
+  storage/      Layer 09 — SQLite: config, spend ledger, chat log, eval
   observability/Layer 08 — traces, metrics
   api/          Layer 01/02 — chat, admin, admission
 widget/         Layer 01 — custom element + React wrapper

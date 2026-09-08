@@ -15,6 +15,7 @@ from app.gateway.budget import get_usage_limiter
 from app.logging_setup import get_logger
 from app.models.schemas import IngestSummary, PropertyIn, PropertyOut
 from app.observability.metrics import METRICS
+from app.storage.chat_log import ChatLog
 from app.storage.db import get_db
 from app.storage.properties import ContactRoute
 
@@ -79,6 +80,43 @@ async def delete_property_corpus(property_id: str, request: Request) -> None:
     await db.conn.execute("DELETE FROM source_state WHERE property_id = ?", (property_id,))
     await db.conn.commit()
     log.warning(f"Deleted the whole corpus for {property_id}.", property_id=property_id)
+
+
+# -- chat log --------------------------------------------------------------
+
+
+@router.get("/properties/{property_id}/chats")
+async def list_chats(
+    property_id: str,
+    limit: int = 50,
+    session_id: str | None = None,
+    deflected: bool = False,
+) -> list[dict]:
+    """What the Guide has been asked, newest first.
+
+    `deflected=true` is the one an operator should read weekly: every turn the
+    Corpus could not answer, which is a list of the documents a client has not
+    sent yet.
+    """
+    return await ChatLog(get_db()).recent(
+        property_id, limit=limit, session_id=session_id, deflected_only=deflected
+    )
+
+
+@router.delete("/properties/{property_id}/chats", status_code=204)
+async def delete_chats(property_id: str) -> None:
+    """Erasure, for transcripts rather than the Corpus.
+
+    Separate from deleting the Corpus on purpose: an owner replacing their
+    documents is not asking for their visitors' questions to be thrown away,
+    and someone asking for the questions to go is not asking to be un-indexed.
+    """
+    deleted = await ChatLog(get_db()).delete_property(property_id)
+    log.warning(
+        f"Deleted {deleted} chat log rows for {property_id}.",
+        property_id=property_id,
+        rows=deleted,
+    )
 
 
 # -- ingestion -------------------------------------------------------------

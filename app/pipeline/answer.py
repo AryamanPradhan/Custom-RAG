@@ -12,8 +12,9 @@ each stage independently.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app.gateway.llm_gateway import LLMGateway, Task
@@ -24,10 +25,11 @@ from app.guardrails.input_guard import (
     sanitise_context,
 )
 from app.guardrails.output_guard import scrub_answer, verify_grounding
+from app.guardrails.patterns import redact_pii
 from app.logging_setup import get_logger
-from app.models.domain import Citation, ScoredChunk
+from app.models.domain import Citation, ScoredChunk, TurnRecord
 from app.observability.metrics import METRICS
-from app.observability.tracing import current_trace_id, span
+from app.observability.tracing import current_trace, current_trace_id, span
 from app.pipeline.intent import Intent, classify_intent
 from app.pipeline.prompts import (
     build_answer_system,
@@ -42,6 +44,24 @@ from app.storage.properties import Property
 log = get_logger(__name__)
 
 MAX_HISTORY_FOR_MODEL = 6
+
+
+# Called with a finished turn, after the Visitor already has their answer.
+OnTurn = Callable[[TurnRecord], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class _TurnDraft:
+    """What the chat log needs that an AnswerResult does not carry.
+
+    The screened question above all: the record must hold the text the model
+    saw, not the raw one, or a redacted card number lands in SQLite anyway.
+    """
+
+    question: str
+    intent: str = "informational"
+    blocked: bool = False
+    grounded: bool = True
 
 
 @dataclass(slots=True)
@@ -64,9 +84,13 @@ class AnswerPipeline:
         rerank_top_n: int = 8,
         min_rerank_score: int = 4,
         min_rerank_relevance: float = 0.2,
+        on_turn: OnTurn | None = None,
     ) -> None:
         self._gateway = gateway
         self._retriever = retriever
+        # Absent by default, so an eval sweep does not file 22 visitor
+        # conversations that no visitor had.
+        self._on_turn = on_turn
         self._top_n = rerank_top_n
         # Both thresholds are carried, and the reranking stage reads whichever
         # matches the configured reranker's units.
@@ -76,7 +100,7 @@ class AnswerPipeline:
     # -- shared stages ---------------------------------------------------
 
     async def _prepare(
-        self, prop: Property, question: str, history: list[dict]
+        self, prop: Property, question: str, history: list[dict], draft: _TurnDraft
     ) -> tuple[str, list[ScoredChunk], str, list[dict], AnswerResult | None]:
         """Screen, plan, retrieve, rerank.
 
@@ -91,6 +115,10 @@ class AnswerPipeline:
         message_verdict = check_message(question)
         if message_verdict.outcome is GuardOutcome.REJECT:
             METRICS.incr("pipeline.blocked", stage="message")
+            # The guard rejected before it ever looked for PII, so this is the
+            # one path where the log has to do its own redaction.
+            draft.question = redact_pii(question)
+            draft.blocked = True
             log.warning("Question rejected by the input guard.", reason=message_verdict.reason)
             return (
                 question,
@@ -108,6 +136,8 @@ class AnswerPipeline:
         history_verdict, history = check_history(history)
         if history_verdict.outcome is GuardOutcome.REJECT:
             METRICS.incr("pipeline.blocked", stage="history")
+            draft.question = message_verdict.message or redact_pii(question)
+            draft.blocked = True
             log.warning("Conversation history rejected by the input guard.",
                         reason=history_verdict.reason)
             return (
@@ -124,6 +154,7 @@ class AnswerPipeline:
             )
 
         clean = message_verdict.message or question
+        draft.question = clean
 
         # Before the planner, because a greeting should cost nothing: no
         # rewrite call, no embedding, no vector search, no rerank.
@@ -131,6 +162,7 @@ class AnswerPipeline:
             intent = classify_intent(clean)
             s.attributes["intent"] = intent.value
             s.summary = f"Read as {intent.value}."
+        draft.intent = intent.value
         if intent is not Intent.INFORMATIONAL:
             METRICS.incr("pipeline.smalltalk", intent=intent.value)
             return (
@@ -205,14 +237,78 @@ class AnswerPipeline:
         ]
         return [*turns, {"role": "user", "content": build_user_turn(question, context)}]
 
+    async def _file(
+        self,
+        prop: Property,
+        draft: _TurnDraft,
+        *,
+        mode: str,
+        answer: str,
+        deflected: bool,
+        grounded: bool,
+        reason: str,
+        citations: list[dict],
+        latency_ms: float,
+    ) -> None:
+        """Hand the finished turn to the chat log.
+
+        Never raises. The visitor has their answer by the time this runs, and
+        a full disk is not a reason to turn a served answer into a 500.
+        """
+        if self._on_turn is None:
+            return
+        trace = current_trace()
+        try:
+            await self._on_turn(
+                TurnRecord(
+                    property_id=prop.property_id,
+                    session_id=trace.session_id if trace else "",
+                    trace_id=current_trace_id(),
+                    question=draft.question,
+                    answer=answer,
+                    mode=mode,
+                    intent=draft.intent,
+                    deflected=deflected,
+                    grounded=grounded,
+                    blocked=draft.blocked,
+                    reason=reason,
+                    citations=citations,
+                    latency_ms=latency_ms,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            METRICS.incr("chat_log.write_failed")
+            log.error(
+                "The turn could not be written to the chat log.",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
     # -- non-streaming (used by evals and the JSON endpoint) --------------
 
     async def answer(
         self, prop: Property, question: str, history: list[dict] | None = None
     ) -> AnswerResult:
-        history = history or []
+        started = time.perf_counter()
+        draft = _TurnDraft(question=question)
+        result = await self._answer(prop, question, history or [], draft)
+        await self._file(
+            prop,
+            draft,
+            mode="json",
+            answer=result.answer,
+            deflected=result.deflected,
+            grounded=result.grounded,
+            reason=result.reason,
+            citations=[asdict(c) for c in result.citations],
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+        return result
+
+    async def _answer(
+        self, prop: Property, question: str, history: list[dict], draft: _TurnDraft
+    ) -> AnswerResult:
         clean, chunks, context, history, early = await self._prepare(
-            prop, question, history
+            prop, question, history, draft
         )
         if early is not None:
             return early
@@ -292,6 +388,51 @@ class AnswerPipeline:
     async def stream(
         self, prop: Property, question: str, history: list[dict] | None = None
     ) -> AsyncIterator[dict]:
+        """Stream the answer to the widget, then file the turn.
+
+        The log has to be assembled from the same events the widget gets,
+        because they are the answer: a `retract` means what streamed was
+        replaced, so recording the tokens would file an answer no visitor was
+        left holding. Filing happens in a `finally`, so a turn a visitor
+        abandoned mid-stream is still recorded with what it had reached.
+        """
+        started = time.perf_counter()
+        draft = _TurnDraft(question=question)
+        tokens: list[str] = []
+        final = ""
+        citations: list[dict] = []
+        deflected = False
+        reason = ""
+
+        try:
+            async for event in self._stream(prop, question, history or [], draft):
+                kind = event.get("type")
+                if kind == "token":
+                    tokens.append(event["text"])
+                elif kind in ("deflect", "retract", "replace"):
+                    final = event["answer"]
+                    reason = event.get("reason", reason)
+                elif kind == "citations":
+                    citations = event["citations"]
+                elif kind == "done":
+                    deflected = event["deflected"]
+                yield event
+        finally:
+            await self._file(
+                prop,
+                draft,
+                mode="stream",
+                answer=final or "".join(tokens).strip(),
+                deflected=deflected,
+                grounded=draft.grounded,
+                reason=reason,
+                citations=citations,
+                latency_ms=(time.perf_counter() - started) * 1000,
+            )
+
+    async def _stream(
+        self, prop: Property, question: str, history: list[dict], draft: _TurnDraft
+    ) -> AsyncIterator[dict]:
         """Yield widget events.
 
         Tokens stream immediately; citations are withheld until the
@@ -300,11 +441,10 @@ class AnswerPipeline:
         That is the price of streaming a verified answer - the alternative is
         several seconds of spinner on every turn.
         """
-        history = history or []
         contact = prop.contact_route.describe()
 
         clean, chunks, context, history, early = await self._prepare(
-            prop, question, history
+            prop, question, history, draft
         )
         if early is not None:
             # The widget renders this as an ordinary reply; the flag is what
@@ -372,6 +512,7 @@ class AnswerPipeline:
         )
         if not verdict.grounded:
             METRICS.incr("pipeline.deflected", stage="grounding")
+            draft.grounded = False
             yield {
                 "type": "retract",
                 "answer": build_deflection(prop.display_name, contact),

@@ -133,3 +133,28 @@ class Citation:
     snippet: str
     published_on: str = ""
     unit: str | None = None
+
+
+@dataclass(slots=True)
+class TurnRecord:
+    """One completed exchange, as it is written to the chat log.
+
+    Built by the pipeline at the end of a turn and handed to whatever is
+    recording - so it carries the *screened* question, never the raw one. A
+    turn that was deflected or blocked is still a turn: the reason it did not
+    answer is the most useful column in the table.
+    """
+
+    property_id: str
+    session_id: str
+    trace_id: str
+    question: str
+    answer: str
+    mode: str                      # json | stream
+    intent: str = "informational"
+    deflected: bool = False
+    grounded: bool = True
+    blocked: bool = False          # rejected by the input guard, never reached a model
+    reason: str = ""
+    citations: list[dict] = field(default_factory=list)
+    latency_ms: float = 0.0
