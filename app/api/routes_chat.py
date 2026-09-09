@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from datetime import UTC
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import require_admin, resolve_property
+from app.api.sessions import resolve_session
 from app.logging_setup import get_logger
 from app.models.schemas import ChatRequest, ChatResponse, CitationOut, FeedbackRequest
 from app.observability.metrics import METRICS
@@ -38,7 +39,8 @@ async def chat(
     prop: Property = Depends(resolve_property),
 ) -> ChatResponse:
     """Non-streaming answer."""
-    trace = start_trace(prop.property_id, payload.session_id or "-")
+    session = resolve_session(prop.property_id, payload.session_id)
+    trace = start_trace(prop.property_id, session.thread_id)
     METRICS.incr("chat.request", mode="json", property_id=prop.property_id)
     try:
         result = await _pipeline(request).answer(
@@ -57,6 +59,7 @@ async def chat(
             deflected=result.deflected,
             grounded=result.grounded,
             trace_id=trace.trace_id,
+            session_id=session.token,
         )
     finally:
         end_trace()
@@ -75,12 +78,17 @@ async def chat_stream(
     streamed but failed the grounding check, and what was shown must be
     replaced by the Deflection it carries.
     """
-    trace = start_trace(prop.property_id, payload.session_id or "-")
+    session = resolve_session(prop.property_id, payload.session_id)
+    trace = start_trace(prop.property_id, session.thread_id)
     METRICS.incr("chat.request", mode="stream", property_id=prop.property_id)
     pipeline = _pipeline(request)
     history = [t.model_dump() for t in payload.history]
 
     async def events():
+        # First, before any model work: the token the Widget must echo on the
+        # next turn. A stream that fails halfway still leaves the visitor in a
+        # thread, which is the case where losing it would be most confusing.
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session.token})}\n\n"
         try:
             async for event in pipeline.stream(prop, payload.message, history):
                 # Client disconnects are common on a website widget - a visitor
@@ -123,8 +131,6 @@ async def feedback(
     this captures is whether an answer was useful, which is what feeds the
     eval set.
     """
-    from datetime import datetime
-
     db = get_db()
     await db.conn.execute(
         """INSERT INTO feedback

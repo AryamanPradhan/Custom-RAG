@@ -8,6 +8,15 @@ take, there is nothing for a planner to orchestrate - so the pipeline is:
 Every stage can fail into a Deflection, which is a designed outcome rather than
 an error. Flat latency, one traceable path, and an eval harness that can score
 each stage independently.
+
+The sequence is written once and rendered twice. What a turn decided is an
+`Outcome` - transport-neutral, markers intact, no trace id - and the two public
+entry points are adapters over it: `answer` renders one as an `AnswerResult`
+for the JSON endpoint and the evals, `stream` renders one as widget events.
+Only generation itself is implemented per transport, because a single call and
+a token stream are genuinely different calls. Everything that decides whether
+an answer may be shown at all lives in `_finish`, so a stage added to the
+sequence reaches both surfaces or neither.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from app.logging_setup import get_logger
 from app.models.domain import Citation, ScoredChunk, TurnRecord
 from app.observability.metrics import METRICS
 from app.observability.tracing import current_trace, current_trace_id, span
+from app.pipeline.citations import MarkerFilter, build_citations, strip_markers
 from app.pipeline.intent import Intent, classify_intent
 from app.pipeline.prompts import (
     build_answer_system,
@@ -51,8 +61,25 @@ OnTurn = Callable[[TurnRecord], Awaitable[None]]
 
 
 @dataclass(slots=True)
+class Outcome:
+    """What the Guide decided this turn, before anything has rendered it.
+
+    The answer keeps its [n] markers. Taking them off is a rendering choice -
+    the Visitor does not want them, `build_citations` and the chat log do - so
+    it belongs in the adapters and not here.
+    """
+
+    answer: str
+    citations: list[Citation] = field(default_factory=list)
+    deflected: bool = False
+    grounded: bool = True
+    reason: str = ""
+    stages: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class _TurnDraft:
-    """What the chat log needs that an AnswerResult does not carry.
+    """What the chat log needs that an Outcome does not carry.
 
     The screened question above all: the record must hold the text the model
     saw, not the raw one, or a redacted card number lands in SQLite anyway.
@@ -61,11 +88,17 @@ class _TurnDraft:
     question: str
     intent: str = "informational"
     blocked: bool = False
-    grounded: bool = True
+    # Set once the turn is decided. `stream` is a generator and cannot return
+    # a value, so this is how the decision reaches the wrapper that files it -
+    # and None is meaningful: it is a Visitor who closed the tab before the
+    # pipeline had decided anything.
+    outcome: Outcome | None = None
 
 
 @dataclass(slots=True)
 class AnswerResult:
+    """An Outcome as the JSON endpoint and the eval harness read it."""
+
     answer: str
     citations: list[Citation] = field(default_factory=list)
     deflected: bool = False
@@ -97,24 +130,49 @@ class AnswerPipeline:
         self._min_score = min_rerank_score
         self._min_relevance = min_rerank_relevance
 
-    # -- shared stages ---------------------------------------------------
+    # -- deciding ---------------------------------------------------------
+
+    def _decline(
+        self,
+        prop: Property,
+        *,
+        reason: str,
+        stage: str,
+        metric: str | None = "pipeline.deflected",
+        grounded: bool = True,
+        stages: dict[str, Any] | None = None,
+    ) -> Outcome:
+        """The Guide declining, in one place.
+
+        Every Deflection is the same four things - the text, the flag, the
+        reason and the counter - and they used to be written out at each site,
+        which is how a stage came to be counted on one transport and not on the
+        other. Passing through here is what keeps the metric and the reason
+        describing the same event.
+        """
+        if metric:
+            METRICS.incr(metric, stage=stage)
+        return Outcome(
+            answer=build_deflection(prop.display_name, prop.contact_route.describe()),
+            deflected=True,
+            grounded=grounded,
+            reason=reason,
+            stages=stages or {},
+        )
 
     async def _prepare(
         self, prop: Property, question: str, history: list[dict], draft: _TurnDraft
-    ) -> tuple[str, list[ScoredChunk], str, list[dict], AnswerResult | None]:
+    ) -> tuple[str, list[ScoredChunk], str, list[dict], Outcome | None]:
         """Screen, plan, retrieve, rerank.
 
-        Returns (clean_question, chunks, context, clean_history, early_result).
-        A non-None early_result means the turn is already decided - blocked or
-        deflected - and the answer model should not be called at all. The
-        history comes back redacted, so callers must use the returned copy
-        rather than the one they passed in.
+        Returns (clean_question, chunks, context, clean_history, early).
+        A non-None early means the turn is already decided - blocked,
+        deflected, or answered without a model - and the answer model should
+        not be called at all. The history comes back redacted, so callers must
+        use the returned copy rather than the one they passed in.
         """
-        contact = prop.contact_route.describe()
-
         message_verdict = check_message(question)
         if message_verdict.outcome is GuardOutcome.REJECT:
-            METRICS.incr("pipeline.blocked", stage="message")
             # The guard rejected before it ever looked for PII, so this is the
             # one path where the log has to do its own redaction.
             draft.question = redact_pii(question)
@@ -125,17 +183,16 @@ class AnswerPipeline:
                 [],
                 "",
                 [],
-                AnswerResult(
-                    answer=build_deflection(prop.display_name, contact),
-                    deflected=True,
+                self._decline(
+                    prop,
                     reason=message_verdict.reason,
-                    trace_id=current_trace_id(),
+                    stage="message",
+                    metric="pipeline.blocked",
                 ),
             )
 
         history_verdict, history = check_history(history)
         if history_verdict.outcome is GuardOutcome.REJECT:
-            METRICS.incr("pipeline.blocked", stage="history")
             draft.question = message_verdict.message or redact_pii(question)
             draft.blocked = True
             log.warning("Conversation history rejected by the input guard.",
@@ -145,11 +202,11 @@ class AnswerPipeline:
                 [],
                 "",
                 [],
-                AnswerResult(
-                    answer=build_deflection(prop.display_name, contact),
-                    deflected=True,
+                self._decline(
+                    prop,
                     reason=history_verdict.reason,
-                    trace_id=current_trace_id(),
+                    stage="history",
+                    metric="pipeline.blocked",
                 ),
             )
 
@@ -170,13 +227,10 @@ class AnswerPipeline:
                 [],
                 "",
                 history,
-                AnswerResult(
-                    # Not a Deflection: nothing was asked and nothing failed.
-                    # It cites nothing because it claims nothing.
+                # Not a Deflection: nothing was asked and nothing failed. It
+                # cites nothing because it claims nothing.
+                Outcome(
                     answer=build_smalltalk(intent.value, prop.display_name),
-                    deflected=False,
-                    reason="",
-                    trace_id=current_trace_id(),
                     stages={"intent": intent.value},
                 ),
             )
@@ -199,22 +253,81 @@ class AnswerPipeline:
         # Property has. There is no second pass to fall back to, which is the
         # point - a Deflection here is a real gap rather than a bad guess.
         if not chunks:
-            METRICS.incr("pipeline.deflected", stage="retrieval")
             return (
                 clean,
                 [],
                 "",
                 history,
-                AnswerResult(
-                    answer=build_deflection(prop.display_name, contact),
-                    deflected=True,
+                self._decline(
+                    prop,
                     reason="nothing in the corpus answers this",
-                    trace_id=current_trace_id(),
+                    stage="retrieval",
                 ),
             )
 
         context = sanitise_context(chunks)
         return clean, chunks, context, history, None
+
+    async def _finish(
+        self,
+        prop: Property,
+        *,
+        question: str,
+        text: str,
+        chunks: list[ScoredChunk],
+        context: str,
+        refused: bool = False,
+    ) -> Outcome:
+        """Everything between a generated answer and a servable one.
+
+        Four policies decide whether a Visitor may see what the model wrote: it
+        declined, it cited nothing, it was not grounded, and whatever scrubbing
+        left behind. Each used to be written once per transport, which is how
+        the streaming path came to count one stage differently from the JSON
+        path and to carry groundedness by a different route. They run here so a
+        rule added to the sequence arrives on both surfaces at once.
+        """
+        if refused or not text.strip():
+            return self._decline(
+                prop,
+                reason="answer model declined or returned nothing",
+                stage="generation",
+            )
+
+        # An answer that cites nothing claims nothing: the system prompt is
+        # explicit that a claim about the property must carry its [n]. So an
+        # uncited answer is a non-answer however warmly it is phrased, and it
+        # becomes a Deflection without a verifier call - which is both cheaper
+        # and safer than showing unverified prose, since the one thing that
+        # could be hiding in it is a claim the model chose not to cite.
+        if not build_citations(chunks, text):
+            return self._decline(
+                prop, reason="the answer cited nothing", stage="uncited"
+            )
+
+        verdict = await verify_grounding(
+            question=question,
+            answer=text,
+            context=context,
+            gateway=self._gateway,
+            property_id=prop.property_id,
+        )
+        if not verdict.grounded:
+            return self._decline(
+                prop,
+                reason=verdict.detail or "answer was not supported by the sources",
+                stage="grounding",
+                grounded=False,
+                stages={"unsupported_claims": verdict.unsupported_claims},
+            )
+
+        contact = prop.contact_route.describe()
+        scrubbed = scrub_answer(text, trusted_text=context + " " + contact)
+        return Outcome(
+            answer=scrubbed,
+            citations=build_citations(chunks, scrubbed),
+            stages={"chunks": len(chunks)},
+        )
 
     async def _rerank(
         self, question: str, chunks: list[ScoredChunk], property_id: str
@@ -236,6 +349,8 @@ class AnswerPipeline:
             if t.get("role") in ("user", "assistant") and t.get("content")
         ]
         return [*turns, {"role": "user", "content": build_user_turn(question, context)}]
+
+    # -- filing -----------------------------------------------------------
 
     async def _file(
         self,
@@ -283,6 +398,33 @@ class AnswerPipeline:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
+    async def _record(
+        self,
+        prop: Property,
+        draft: _TurnDraft,
+        outcome: Outcome,
+        *,
+        mode: str,
+        started: float,
+    ) -> None:
+        """File a decided turn, markers and all.
+
+        The log takes the Outcome rather than what was rendered: an operator
+        checking whether an answer was legitimate needs to see which claim came
+        from which source, which is exactly what the screen no longer shows.
+        """
+        await self._file(
+            prop,
+            draft,
+            mode=mode,
+            answer=outcome.answer,
+            deflected=outcome.deflected,
+            grounded=outcome.grounded,
+            reason=outcome.reason,
+            citations=[asdict(c) for c in outcome.citations],
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+
     # -- non-streaming (used by evals and the JSON endpoint) --------------
 
     async def answer(
@@ -290,31 +432,30 @@ class AnswerPipeline:
     ) -> AnswerResult:
         started = time.perf_counter()
         draft = _TurnDraft(question=question)
-        result = await self._answer(prop, question, history or [], draft)
-        await self._file(
-            prop,
-            draft,
-            mode="json",
-            answer=result.answer,
-            deflected=result.deflected,
-            grounded=result.grounded,
-            reason=result.reason,
-            citations=[asdict(c) for c in result.citations],
-            latency_ms=(time.perf_counter() - started) * 1000,
+        outcome = await self._decide(prop, question, history or [], draft)
+        await self._record(prop, draft, outcome, mode="json", started=started)
+        return AnswerResult(
+            answer=strip_markers(outcome.answer),
+            citations=outcome.citations,
+            deflected=outcome.deflected,
+            grounded=outcome.grounded,
+            reason=outcome.reason,
+            trace_id=current_trace_id(),
+            stages=outcome.stages,
         )
-        return result
 
-    async def _answer(
+    async def _decide(
         self, prop: Property, question: str, history: list[dict], draft: _TurnDraft
-    ) -> AnswerResult:
+    ) -> Outcome:
+        """One model call, then the shared finish."""
         clean, chunks, context, history, early = await self._prepare(
             prop, question, history, draft
         )
         if early is not None:
+            draft.outcome = early
             return early
 
-        contact = prop.contact_route.describe()
-        system = build_answer_system(prop.display_name, contact)
+        system = build_answer_system(prop.display_name, prop.contact_route.describe())
 
         with span("generate") as s:
             result = await self._gateway.complete(
@@ -333,55 +474,16 @@ class AnswerPipeline:
                 else "The answer model declined to respond."
             )
 
-        if result.refused or not result.text.strip():
-            METRICS.incr("pipeline.deflected", stage="generation")
-            return AnswerResult(
-                answer=build_deflection(prop.display_name, contact),
-                deflected=True,
-                reason="answer model declined or returned nothing",
-                trace_id=current_trace_id(),
-            )
-
-        # An answer that cites nothing claims nothing: the system prompt is
-        # explicit that a claim about the property must carry its [n]. So an
-        # uncited answer is a non-answer however warmly it is phrased, and it
-        # becomes a Deflection without a verifier call - which is both cheaper
-        # and safer than showing unverified prose, since the one thing that
-        # could be hiding in it is a claim the model chose not to cite.
-        if not build_citations(chunks, result.text):
-            METRICS.incr("pipeline.deflected", stage="uncited")
-            return AnswerResult(
-                answer=build_deflection(prop.display_name, contact),
-                deflected=True,
-                reason="the answer cited nothing",
-                trace_id=current_trace_id(),
-            )
-
-        verdict = await verify_grounding(
+        outcome = await self._finish(
+            prop,
             question=clean,
-            answer=result.text,
+            text=result.text,
+            chunks=chunks,
             context=context,
-            gateway=self._gateway,
-            property_id=prop.property_id,
+            refused=result.refused,
         )
-        if not verdict.grounded:
-            METRICS.incr("pipeline.deflected", stage="grounding")
-            return AnswerResult(
-                answer=build_deflection(prop.display_name, contact),
-                deflected=True,
-                grounded=False,
-                reason=verdict.detail or "answer was not supported by the sources",
-                trace_id=current_trace_id(),
-                stages={"unsupported_claims": verdict.unsupported_claims},
-            )
-
-        text = scrub_answer(result.text, trusted_text=context + " " + contact)
-        return AnswerResult(
-            answer=text,
-            citations=build_citations(chunks, text),
-            trace_id=current_trace_id(),
-            stages={"chunks": len(chunks)},
-        )
+        draft.outcome = outcome
+        return outcome
 
     # -- streaming (the widget) ------------------------------------------
 
@@ -390,50 +492,44 @@ class AnswerPipeline:
     ) -> AsyncIterator[dict]:
         """Stream the answer to the widget, then file the turn.
 
-        The log has to be assembled from the same events the widget gets,
-        because they are the answer: a `retract` means what streamed was
-        replaced, so recording the tokens would file an answer no visitor was
-        left holding. Filing happens in a `finally`, so a turn a visitor
-        abandoned mid-stream is still recorded with what it had reached.
+        What is filed is the decision, not the tokens: a `retract` means what
+        streamed was replaced, so recording the tokens would file an answer no
+        visitor was left holding. Filing happens in a `finally`, so a turn a
+        visitor abandoned mid-stream is still recorded - and that is the one
+        case with no decision to file, where what reached the screen is all
+        there is.
         """
         started = time.perf_counter()
         draft = _TurnDraft(question=question)
-        tokens: list[str] = []
-        final = ""
-        citations: list[dict] = []
-        deflected = False
-        reason = ""
+        shown: list[str] = []
 
         try:
             async for event in self._stream(prop, question, history or [], draft):
-                kind = event.get("type")
-                if kind == "token":
-                    tokens.append(event["text"])
-                elif kind in ("deflect", "retract", "replace"):
-                    final = event["answer"]
-                    reason = event.get("reason", reason)
-                elif kind == "citations":
-                    citations = event["citations"]
-                elif kind == "done":
-                    deflected = event["deflected"]
+                if event.get("type") == "token":
+                    shown.append(event["text"])
                 yield event
         finally:
-            await self._file(
-                prop,
-                draft,
-                mode="stream",
-                answer=final or "".join(tokens).strip(),
-                deflected=deflected,
-                grounded=draft.grounded,
-                reason=reason,
-                citations=citations,
-                latency_ms=(time.perf_counter() - started) * 1000,
-            )
+            if draft.outcome is not None:
+                await self._record(
+                    prop, draft, draft.outcome, mode="stream", started=started
+                )
+            else:
+                await self._file(
+                    prop,
+                    draft,
+                    mode="stream",
+                    answer="".join(shown).strip(),
+                    deflected=False,
+                    grounded=True,
+                    reason="",
+                    citations=[],
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                )
 
     async def _stream(
         self, prop: Property, question: str, history: list[dict], draft: _TurnDraft
     ) -> AsyncIterator[dict]:
-        """Yield widget events.
+        """Render a turn as widget events.
 
         Tokens stream immediately; citations are withheld until the
         groundedness check clears. If it fails, a `retract` event tells the
@@ -441,25 +537,27 @@ class AnswerPipeline:
         That is the price of streaming a verified answer - the alternative is
         several seconds of spinner on every turn.
         """
-        contact = prop.contact_route.describe()
-
         clean, chunks, context, history, early = await self._prepare(
             prop, question, history, draft
         )
         if early is not None:
-            # The widget renders this as an ordinary reply; the flag is what
-            # distinguishes "we could not answer" from "nothing was asked",
-            # so it has to carry the result's own value rather than True.
-            yield {"type": "deflect", "answer": early.answer, "reason": early.reason}
+            # Nothing has been shown yet, so this is an ordinary reply rather
+            # than a retraction. The flag is what distinguishes "we could not
+            # answer" from "nothing was asked", so it has to carry the
+            # outcome's own value rather than True.
             yield {
-                "type": "done",
-                "trace_id": current_trace_id(),
-                "deflected": early.deflected,
+                "type": "deflect",
+                "answer": strip_markers(early.answer),
+                "reason": early.reason,
             }
+            yield self._done(early.deflected)
             return
 
-        system = build_answer_system(prop.display_name, contact)
-        buffer: list[str] = []
+        system = build_answer_system(prop.display_name, prop.contact_route.describe())
+        # A marker can arrive split across tokens, so the filter holds back
+        # anything that might still become one. `raw` stays unfiltered.
+        raw: list[str] = []
+        markers = MarkerFilter()
 
         try:
             async for token in self._gateway.stream_answer(
@@ -468,101 +566,57 @@ class AnswerPipeline:
                 max_tokens=1200,
                 property_id=prop.property_id,
             ):
-                buffer.append(token)
-                yield {"type": "token", "text": token}
+                raw.append(token)
+                visible = markers.feed(token)
+                if visible:
+                    yield {"type": "token", "text": visible}
+            tail = markers.flush()
+            if tail:
+                yield {"type": "token", "text": tail}
         except Exception as exc:  # noqa: BLE001
+            # Counted as a stream failure and not as a Deflection: the Corpus
+            # was not the problem, and an operator reading the deflected turns
+            # weekly should not find infrastructure in that list.
             METRICS.incr("pipeline.stream_failed")
             log.error("Answer generation failed mid-stream; retracting.",
                       error=f"{type(exc).__name__}: {exc}")
-            yield {
-                "type": "retract",
-                "answer": build_deflection(prop.display_name, contact),
-                "reason": "generation failed",
-            }
-            yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
-            return
-
-        text = "".join(buffer).strip()
-        if not text:
-            yield {
-                "type": "retract",
-                "answer": build_deflection(prop.display_name, contact),
-                "reason": "empty answer",
-            }
-            yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
-            return
-
-        # Same rule as the non-streaming path: uncited is a non-answer.
-        if not build_citations(chunks, text):
-            METRICS.incr("pipeline.deflected", stage="uncited")
-            yield {
-                "type": "retract",
-                "answer": build_deflection(prop.display_name, contact),
-                "reason": "the answer cited nothing",
-            }
-            yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
-            return
-
-        verdict = await verify_grounding(
-            question=clean,
-            answer=text,
-            context=context,
-            gateway=self._gateway,
-            property_id=prop.property_id,
-        )
-        if not verdict.grounded:
-            METRICS.incr("pipeline.deflected", stage="grounding")
-            draft.grounded = False
-            yield {
-                "type": "retract",
-                "answer": build_deflection(prop.display_name, contact),
-                "reason": verdict.detail or "answer was not supported by the sources",
-            }
-            yield {"type": "done", "trace_id": current_trace_id(), "deflected": True}
-            return
-
-        scrubbed = scrub_answer(text, trusted_text=context + " " + contact)
-        if scrubbed != text:
-            yield {"type": "replace", "answer": scrubbed}
-
-        yield {
-            "type": "citations",
-            "citations": [
-                {
-                    "index": c.index,
-                    "uri": c.uri,
-                    "label": c.label,
-                    "snippet": c.snippet,
-                    "published_on": c.published_on,
-                    "unit": c.unit,
-                }
-                for c in build_citations(chunks, scrubbed)
-            ],
-        }
-        yield {"type": "done", "trace_id": current_trace_id(), "deflected": False}
-
-
-def build_citations(chunks: list[ScoredChunk], answer: str) -> list[Citation]:
-    """Return only the sources the answer actually cited.
-
-    Listing all eight retrieved chunks would imply the answer leaned on all of
-    them. Citations are a checkable claim about provenance, so they track the
-    [n] markers the model actually wrote.
-    """
-    cited: list[Citation] = []
-    for i, scored in enumerate(chunks, start=1):
-        if f"[{i}]" not in answer:
-            continue
-        chunk = scored.chunk
-        snippet = chunk.text.strip().replace("\n", " ")
-        cited.append(
-            Citation(
-                index=i,
-                uri=chunk.uri,
-                label=scored.citation_label,
-                snippet=snippet[:220] + ("..." if len(snippet) > 220 else ""),
-                published_on=chunk.fetched_at,
-                unit=chunk.unit,
+            failed = self._decline(
+                prop, reason="generation failed", stage="generation", metric=None
             )
+            draft.outcome = failed
+            yield self._retract(failed)
+            yield self._done(True)
+            return
+
+        streamed = "".join(raw).strip()
+        outcome = await self._finish(
+            prop, question=clean, text=streamed, chunks=chunks, context=context
         )
-    return cited
+        draft.outcome = outcome
+
+        if outcome.deflected:
+            yield self._retract(outcome)
+            yield self._done(True)
+            return
+
+        # Scrubbing may have changed what is already on screen.
+        if outcome.answer != streamed:
+            yield {"type": "replace", "answer": strip_markers(outcome.answer)}
+
+        yield {"type": "citations", "citations": [asdict(c) for c in outcome.citations]}
+        yield self._done(False)
+
+    def _retract(self, outcome: Outcome) -> dict:
+        """Take back what streamed.
+
+        The Visitor has already read tokens, so a Deflection at this point has
+        to say that they no longer stand.
+        """
+        return {
+            "type": "retract",
+            "answer": strip_markers(outcome.answer),
+            "reason": outcome.reason,
+        }
+
+    def _done(self, deflected: bool) -> dict:
+        return {"type": "done", "trace_id": current_trace_id(), "deflected": deflected}

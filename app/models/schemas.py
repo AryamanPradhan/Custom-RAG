@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.config import default_spend_cap_usd
+
 
 class ChatTurn(BaseModel):
     role: Literal["user", "assistant"]
@@ -19,6 +21,9 @@ class ChatRequest(BaseModel):
 
     message: str = Field(min_length=1, max_length=4000)
     history: list[ChatTurn] = Field(default_factory=list, max_length=20)
+    # The token the server issued on a previous turn. Untrusted like the rest
+    # of this: it is verified before it is believed, and replaced when it does
+    # not check out - see app/api/sessions.py.
     session_id: str | None = Field(default=None, max_length=64)
 
     @field_validator("message")
@@ -45,6 +50,9 @@ class ChatResponse(BaseModel):
     deflected: bool = False
     grounded: bool = True
     trace_id: str = ""
+    # Echo this back on the next turn to stay in the same thread. It may be a
+    # different token than the one sent: an unverifiable one is replaced.
+    session_id: str = ""
 
 
 # -- operator surface ------------------------------------------------------
@@ -62,7 +70,9 @@ class PropertyIn(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
     allowed_origins: list[str] = Field(min_length=1)
     contact_route: ContactRouteIn = Field(default_factory=ContactRouteIn)
-    daily_spend_cap_usd: float = Field(default=5.0, gt=0, le=1000)
+    daily_spend_cap_usd: float = Field(
+        default_factory=default_spend_cap_usd, gt=0, le=1000
+    )
 
 
 class PropertyOut(BaseModel):

@@ -14,8 +14,17 @@
 > text the provider saw), `CHAT_LOG_RETENTION_DAYS` bounds how long a row
 > lives, `CHAT_LOG_ENABLED=false` turns the whole thing off for a client who
 > wants nothing kept, and `DELETE /admin/properties/{id}/chats` erases on
-> request. What has not changed: no visitor identifier is stored beyond the
-> `session_id` the widget itself generates, and no IP address is.
+> request. What has not changed: no visitor identifier is stored beyond a
+> session id, and no IP address is.
+>
+> That session id is now **issued and signed by the server** rather than picked
+> by the widget - see `app/api/sessions.py`. It has to be: the log groups a
+> conversation by it, and a value the browser chooses is a value any browser
+> can choose, so a visitor could file their turns into somebody else's thread
+> and the log would answer "what did the Guide tell my guest?" with a
+> conversation two people had. The token is an HMAC over the thread id, the
+> Property and an issue time, so verification stays one hash and no lookup -
+> the store this ADR refuses is still not there.
 
 ## Original decision
 

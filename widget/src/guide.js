@@ -50,10 +50,7 @@ const STYLES = `
   .msg.guide { align-self: flex-start; background: #f1f3f5; border-bottom-left-radius: 3px; }
   .msg.error { align-self: flex-start; background: #fdeaea; color: #8a1c1c; }
 
-  .cites { align-self: flex-start; max-width: 88%; font-size: 12px; color: #555; display: flex; flex-direction: column; gap: 4px; }
-  .cites a { color: #1f6feb; text-decoration: none; }
-  .cites a:hover { text-decoration: underline; }
-  .cites .stamp { color: #888; }
+  .cites { align-self: flex-start; max-width: 88%; font-size: 12px; color: #777; font-style: italic; }
 
   .dots span { display: inline-block; width: 6px; height: 6px; margin-right: 3px; border-radius: 50%; background: #999; animation: b 1.2s infinite; }
   .dots span:nth-child(2) { animation-delay: .2s; }
@@ -82,12 +79,19 @@ class HotelGuide extends HTMLElement {
     super();
     this._history = [];
     this._busy = false;
-    this._sessionId = Math.random().toString(36).slice(2, 14);
+    // Issued and signed by the server, not picked here: a thread key the
+    // browser chooses is one any browser can choose, including one already in
+    // use by another visitor. Null until the first reply carries one.
+    this._sessionId = null;
   }
 
   connectedCallback() {
     this.propertyId = this.getAttribute("property-id") || "";
     this.endpoint = (this.getAttribute("endpoint") || "").replace(/\/$/, "");
+    // sessionStorage, not localStorage: the thread should end with the tab.
+    // The transcript is deliberately not restored - the server never had it,
+    // and half-restoring a conversation reads worse than starting one.
+    this._sessionId = this._recall();
     // Not `this.title`: that is a reflected HTMLElement property, and
     // assigning it stamps a title attribute on the host, giving every visitor
     // a stray browser tooltip over the launcher.
@@ -159,6 +163,31 @@ class HotelGuide extends HTMLElement {
     if (open) this.$input.focus();
   }
 
+  _storageKey() {
+    return `hotel-guide:${this.propertyId}:session`;
+  }
+
+  _recall() {
+    // Private browsing and blocked site data both throw on access rather than
+    // returning null, and a visitor who cannot store one should still be able
+    // to ask a question.
+    try {
+      return sessionStorage.getItem(this._storageKey());
+    } catch {
+      return null;
+    }
+  }
+
+  _remember(sessionId) {
+    if (!sessionId) return;
+    this._sessionId = sessionId;
+    try {
+      sessionStorage.setItem(this._storageKey(), sessionId);
+    } catch {
+      /* the turn still works; only continuity across a reload is lost */
+    }
+  }
+
   _append(who, text) {
     const el = document.createElement("div");
     el.className = `msg ${who}`;
@@ -178,30 +207,44 @@ class HotelGuide extends HTMLElement {
   }
 
   _citations(list) {
+    // Not the source list. A visitor is not going to open a PDF to check a
+    // check-in time, and the labels are built from filenames - "08 Frequently
+    // Asked Questions - Page 2" tells them nothing they wanted to know.
+    //
+    // The date is a different matter and does not go with them. Nothing here
+    // is crawled, so a corpus only changes when the owner sends new documents:
+    // a property can rewrite its cancellation policy and the Guide will keep
+    // answering from the old one until someone forwards the new PDF. This line
+    // is what stops a possibly-stale policy being stated as current fact.
     if (!list || !list.length) return;
     const box = document.createElement("div");
     box.className = "cites";
-    for (const c of list) {
-      const row = document.createElement("div");
-      const link = document.createElement("a");
-      link.href = c.uri;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = `[${c.index}] ${c.label}`;
-      row.append(link);
-      // A corpus only changes when the owner sends new material, so it can
-      // lag what the property does today. Showing
-      // when a source was published is how a visitor can tell.
-      if (c.published_on) {
-        const stamp = document.createElement("span");
-        stamp.className = "stamp";
-        stamp.textContent = ` — as published ${c.published_on}`;
-        row.append(stamp);
-      }
-      box.append(row);
-    }
+    box.textContent = this._provenance(list);
     this.$log.append(box);
     this.$log.scrollTop = this.$log.scrollHeight;
+  }
+
+  _provenance(list) {
+    // The oldest source, not the newest: an answer is only as current as the
+    // least fresh thing it was built from.
+    const dates = list.map((c) => c.published_on).filter(Boolean).sort();
+    const when = dates.length ? this._readableDate(dates[0]) : null;
+    // A date we cannot read is worse than no date - "published not-a-date"
+    // reads as a bug, and this line is here to build confidence.
+    if (!when) return "Based on the property's published guest information.";
+    return `Based on guest information published ${when}.`;
+  }
+
+  _readableDate(raw) {
+    // Parsed by hand rather than through Date(string): "2026-09-07" is read as
+    // UTC midnight, which renders as the 6th for any visitor west of Greenwich.
+    const [y, m, d] = String(raw).slice(0, 10).split("-").map(Number);
+    if (!y || !m || !d) return null;
+    return new Date(y, m - 1, d).toLocaleDateString(undefined, {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
   }
 
   async _submit() {
@@ -257,7 +300,9 @@ class HotelGuide extends HTMLElement {
             continue;
           }
 
-          if (event.type === "token") {
+          if (event.type === "session") {
+            this._remember(event.session_id);
+          } else if (event.type === "token") {
             if (!bubble) {
               typing.remove();
               bubble = this._append("guide", "");

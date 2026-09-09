@@ -20,7 +20,8 @@ from app.models.domain import (
     SourceKind,
 )
 from app.models.schemas import CitationOut
-from app.pipeline.answer import AnswerPipeline, build_citations
+from app.pipeline.answer import AnswerPipeline
+from app.pipeline.citations import build_citations
 from app.storage.properties import ContactRoute, Property
 
 
@@ -307,6 +308,191 @@ class TestStreaming:
         assert kinds.index("citations") > max(
             i for i, k in enumerate(kinds) if k == "token"
         )
+        assert events[-1]["deflected"] is False
+
+
+class BothTransports(FakeGateway):
+    """Serves one answer through `complete` and through `stream_answer`.
+
+    So that a difference between the two paths is the pipeline's difference and
+    not the fake's.
+    """
+
+    async def stream_answer(self, **kwargs):
+        self.calls.append("answer")
+        for word in self._answer.split(" "):
+            yield word + " "
+
+
+class TestBothTransportsDecideAlike:
+    """The JSON endpoint and the widget are two renderings of one policy.
+
+    Each case below is a way an answer can turn out not to be servable, and the
+    assertion is that it fails the same way whichever surface asked. The two
+    paths used to implement these rules separately, and the streaming copy was
+    the one no test ran - so a rule could be changed on one surface and left on
+    the other without anything going red.
+    """
+
+    CASES = [
+        pytest.param(
+            "Check-in is from 2pm.",
+            True,
+            True,
+            "the answer cited nothing",
+            id="uncited",
+        ),
+        pytest.param(
+            "",
+            True,
+            True,
+            "answer model declined or returned nothing",
+            id="empty",
+        ),
+        pytest.param(
+            "Free cancellation [1].",
+            False,
+            True,
+            "answer was not supported by the sources",
+            id="ungrounded",
+        ),
+        pytest.param(
+            "Check-in is from 2pm [1].",
+            True,
+            False,
+            "nothing in the corpus answers this",
+            id="nothing-retrieved",
+        ),
+    ]
+
+    @pytest.mark.parametrize(("answer", "grounded", "retrieved", "reason"), CASES)
+    async def test_the_same_failure_deflects_the_same_way(
+        self, prop: Property, answer: str, grounded: bool, retrieved: bool, reason: str
+    ) -> None:
+        chunks = [_chunk("Check-in is from 2pm.")] if retrieved else []
+
+        served = await _pipeline(
+            BothTransports(answer=answer, grounded=grounded), chunks
+        ).answer(prop, "what time is check-in?")
+
+        events = [
+            e
+            async for e in _pipeline(
+                BothTransports(answer=answer, grounded=grounded), chunks
+            ).stream(prop, "what time is check-in?")
+        ]
+        declined = next(e for e in events if e["type"] in ("deflect", "retract"))
+
+        assert served.deflected
+        assert events[-1]["deflected"] is True
+        assert served.reason == declined["reason"] == reason
+        assert served.answer == declined["answer"]
+        assert served.citations == []
+        assert "citations" not in [e["type"] for e in events]
+
+    async def test_an_answer_is_served_the_same_way(self, prop: Property) -> None:
+        chunks = [_chunk("Check-in is from 2pm.")]
+
+        served = await _pipeline(BothTransports(), chunks).answer(
+            prop, "what time is check-in?"
+        )
+        events = [
+            e
+            async for e in _pipeline(BothTransports(), chunks).stream(
+                prop, "what time is check-in?"
+            )
+        ]
+
+        streamed = "".join(e["text"] for e in events if e["type"] == "token").strip()
+        cited = next(e for e in events if e["type"] == "citations")
+
+        assert not served.deflected
+        assert events[-1]["deflected"] is False
+        # The marker is gone from both, and gone the same way: the streaming
+        # filter and the one-shot strip have to agree or the widget shows
+        # something the JSON endpoint does not.
+        assert "[1]" not in served.answer
+        assert streamed == served.answer
+        assert [c["index"] for c in cited["citations"]] == [
+            c.index for c in served.citations
+        ]
+
+
+class TestStreamRendering:
+    """What the widget is told, as distinct from what was decided.
+
+    A Deflection reached before any token has been shown is an ordinary reply;
+    one reached after is a retraction, because the Visitor has already read
+    prose that no longer stands.
+    """
+
+    async def test_an_early_deflection_is_not_a_retraction(self, prop: Property) -> None:
+        events = [
+            e
+            async for e in _pipeline(BothTransports(), []).stream(
+                prop, "is the pool heated in December?"
+            )
+        ]
+        kinds = [e["type"] for e in events]
+
+        assert "deflect" in kinds
+        assert "retract" not in kinds
+        assert "token" not in kinds
+
+    async def test_smalltalk_streams_as_a_reply_not_a_deflection(
+        self, prop: Property
+    ) -> None:
+        """Nothing was asked and nothing failed, so the flag has to carry the
+        outcome's own value rather than True."""
+        events = [
+            e async for e in _pipeline(BothTransports(), []).stream(prop, "hi")
+        ]
+
+        assert events[0]["type"] == "deflect"
+        assert events[-1]["deflected"] is False
+
+    async def test_a_failure_mid_stream_retracts_what_was_shown(
+        self, prop: Property
+    ) -> None:
+        """The provider dropping the connection halfway leaves half an answer on
+        screen, which is worse than no answer - it reads as a complete one."""
+
+        class FailsHalfway(BothTransports):
+            async def stream_answer(self, **kwargs):
+                self.calls.append("answer")
+                yield "Check-in is "
+                raise RuntimeError("connection reset")
+
+        events = [
+            e
+            async for e in _pipeline(
+                FailsHalfway(), [_chunk("Check-in is from 2pm.")]
+            ).stream(prop, "what time is check-in?")
+        ]
+        kinds = [e["type"] for e in events]
+        retract = next(e for e in events if e["type"] == "retract")
+
+        assert kinds == ["token", "retract", "done"]
+        assert retract["reason"] == "generation failed"
+        assert "+44 1234 567890" in retract["answer"]
+        assert events[-1]["deflected"] is True
+
+    async def test_scrubbing_replaces_what_was_streamed(self, prop: Property) -> None:
+        """A contact detail the model invented streams before anything can
+        catch it, so the widget is told to swap the text it is holding."""
+        invented = "Call us on +44 9999 000111 to confirm [1]."
+
+        events = [
+            e
+            async for e in _pipeline(
+                BothTransports(answer=invented), [_chunk("Check-in is from 2pm.")]
+            ).stream(prop, "how do I confirm?")
+        ]
+        replace = next((e for e in events if e["type"] == "replace"), None)
+
+        assert replace is not None, "an answer altered by scrubbing must be replaced"
+        assert "+44 9999 000111" not in replace["answer"]
+        assert "[1]" not in replace["answer"]
         assert events[-1]["deflected"] is False
 
 

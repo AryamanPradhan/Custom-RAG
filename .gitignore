@@ -20,3 +20,10 @@ build/
 # Derived exports for inspection - regenerate, never commit
 data/chunks-export.*
 data/guide.db
+# WAL sidecars, written whenever the database is open
+data/guide.db-wal
+data/guide.db-shm
+
+# Coverage data - regenerate, never commit
+.coverage
+htmlcov/

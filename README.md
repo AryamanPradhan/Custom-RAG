@@ -32,7 +32,7 @@ A fixed pipeline, not an agent loop — see [ADR 0001](docs/adr/0001-fixed-pipel
 | **Rerank** | Cohere rerank-v3.5 scores the 40 candidates; nothing above threshold means deflect, don't answer |
 | **Answer** | GPT-4o mini, sources fenced as data, citations required per claim |
 | **Verify** | A second GPT-4o mini pass checks every property-specific claim against the sources. **Blocking**. An uncited answer skips the call and deflects — it claims nothing |
-| **Cite** | Returns only the sources the answer actually cited, date-stamped |
+| **Cite** | Returns only the sources the answer actually cited, date-stamped — then strips the `[n]` markers, which are provenance for the pipeline and clutter on screen |
 
 Routed per task through one gateway — see [ADR 0002](docs/adr/0002-three-model-providers.md).
 OpenAI serves every chat task, Cohere reranks, Google embeds. Cheap model where
@@ -61,6 +61,19 @@ guide onboard casa-verde "Casa Verde" \
 guide upload casa-verde ./house-rules.pdf     # a folder works too, walked recursively
 guide ask    casa-verde "can I bring my dog?"
 ```
+
+To try it before there is a client site, the API serves a test console at
+`/console` — the chat plus what sits under it: the raw event stream, the
+session token, the trace id, per-turn latency, and which stage deflected.
+
+```bash
+guide origins casa-verde --add http://localhost:8000   # the console's own origin
+uvicorn app.main:app --reload                          # then open /console
+```
+
+The Origin header identifies the Property, so the console has to be served
+from a registered origin like anything else — an unregistered one gets the
+same 403 there as any other caller.
 
 Then one line on the client's site:
 
@@ -151,8 +164,15 @@ It holds visitor text, so:
   at startup. `CHAT_LOG_ENABLED=false` records nothing at all.
 - `DELETE /admin/properties/{id}/chats` erases transcripts on request —
   separate from deleting the corpus, because those are different asks.
-- Nothing identifies a visitor beyond the `session_id` their widget generated.
-  No IP address is stored.
+- Nothing identifies a visitor beyond a session id. No IP address is stored.
+
+The session id is issued and signed by the server, never chosen by the widget
+(`app/api/sessions.py`). Threads are what the log groups on, so an id the
+browser picks is an id any browser can pick — and a visitor who names someone
+else's thread files their turns into that conversation. The token is an HMAC
+over the thread, the property and an issue time: one hash to verify, no lookup,
+no session store. Set `SESSION_SECRET` in production; without it the key is
+per-process and every restart starts everyone over.
 
 Eval sweeps are deliberately not recorded: 22 invented questions filed as
 visitor conversations would poison the one table that says what real people ask.

@@ -20,7 +20,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from app.api import deps, routes_admin, routes_chat
+from app.api import deps, routes_admin, routes_chat, sessions
 from app.api.deps import PLACEHOLDER_ADMIN_KEY
 from app.config import Settings
 from app.gateway.budget import UsageLimiter, set_usage_limiter
@@ -124,11 +124,13 @@ async def api(tmp_path, monkeypatch):
         rate_limit_per_minute=600,
         rate_limit_burst=50,
         max_upload_mb=1,
+        session_secret="test-secret",
     )
     # Both modules import get_settings by name, and the real one is lru_cached
     # against the developer's own .env.
     monkeypatch.setattr(deps, "get_settings", lambda: settings)
     monkeypatch.setattr(routes_admin, "get_settings", lambda: settings)
+    monkeypatch.setattr(sessions, "get_settings", lambda: settings)
     # The rate limiter and the usage limiter are process-wide singletons.
     monkeypatch.setattr(deps, "_limiter", None)
     set_usage_limiter(UsageLimiter(spend_cap_usd=0, call_cap=0))
@@ -225,6 +227,7 @@ class TestAdmission:
     async def test_the_rate_limit_smooths_a_burst_per_ip(self, api: Harness) -> None:
         api.settings.rate_limit_per_minute = 1
         api.settings.rate_limit_burst = 2
+        api.settings.trusted_proxy_hops = 1
         headers = {"Origin": ORIGIN, "X-Forwarded-For": "203.0.113.7"}
 
         first = await api.client.post("/chat", **_ask(), headers=headers)
@@ -237,15 +240,56 @@ class TestAdmission:
 
     async def test_one_visitors_burst_does_not_silence_another(self, api: Harness) -> None:
         """Behind a proxy the socket peer is the proxy, so the bucket keys off
-        the first forwarded hop - otherwise every visitor shares one bucket."""
+        the hop that proxy appended - otherwise every visitor shares one
+        bucket. It is the *last* entry, not the first: everything to its left
+        is whatever the caller chose to send."""
         api.settings.rate_limit_per_minute = 1
         api.settings.rate_limit_burst = 1
+        api.settings.trusted_proxy_hops = 1
         flooder = {"Origin": ORIGIN, "X-Forwarded-For": "203.0.113.7, 10.0.0.1"}
         bystander = {"Origin": ORIGIN, "X-Forwarded-For": "198.51.100.4"}
 
         assert (await api.client.post("/chat", **_ask(), headers=flooder)).status_code == 200
         assert (await api.client.post("/chat", **_ask(), headers=flooder)).status_code == 429
         assert (await api.client.post("/chat", **_ask(), headers=bystander)).status_code == 200
+
+    async def test_a_forged_forwarded_header_cannot_mint_a_fresh_bucket(
+        self, api: Harness
+    ) -> None:
+        """The header is client-supplied. With no proxy in front, reading it
+        would let one caller vary it per request and never meet the limit."""
+        api.settings.rate_limit_per_minute = 1
+        api.settings.rate_limit_burst = 1
+        api.settings.trusted_proxy_hops = 0
+
+        first = await api.client.post(
+            "/chat", **_ask(), headers={"Origin": ORIGIN, "X-Forwarded-For": "203.0.113.7"}
+        )
+        second = await api.client.post(
+            "/chat", **_ask(), headers={"Origin": ORIGIN, "X-Forwarded-For": "198.51.100.4"}
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+
+    async def test_a_chain_shorter_than_the_hop_count_is_not_trusted(
+        self, api: Harness
+    ) -> None:
+        """Two proxies configured but one entry in the chain means the header
+        did not come from where it should have, so it is not read at all."""
+        api.settings.rate_limit_per_minute = 1
+        api.settings.rate_limit_burst = 1
+        api.settings.trusted_proxy_hops = 2
+
+        first = await api.client.post(
+            "/chat", **_ask(), headers={"Origin": ORIGIN, "X-Forwarded-For": "203.0.113.7"}
+        )
+        second = await api.client.post(
+            "/chat", **_ask(), headers={"Origin": ORIGIN, "X-Forwarded-For": "198.51.100.4"}
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 429
 
     async def test_the_property_cap_closes_the_endpoint_for_the_day(self, api: Harness) -> None:
         """Checked before the turn starts. The real backstop behind the rate
@@ -347,7 +391,12 @@ class TestChat:
             for line in response.text.splitlines()
             if line.startswith("data: ")
         ]
-        assert [e["type"] for e in events] == ["token", "citations", "done"]
+        assert [e["type"] for e in events] == [
+            "session",
+            "token",
+            "citations",
+            "done",
+        ]
 
     async def test_a_retraction_reaches_the_widget(self, api: Harness) -> None:
         """The event that matters: the answer streamed, then failed the
@@ -379,6 +428,74 @@ class TestChat:
         assert events[-1]["type"] == "error"
         # No stack trace, no model output, no internals.
         assert events[-1]["message"] == "Something went wrong."
+
+
+class TestSessions:
+    """The thread key is issued here, not chosen by the caller. Token mechanics
+    are covered in tests/test_sessions.py; this is the wiring."""
+
+    async def test_an_answer_carries_a_session_to_echo(self, api: Harness) -> None:
+        response = await api.client.post("/chat", **_ask(), headers={"Origin": ORIGIN})
+        assert response.json()["session_id"]
+
+    async def test_echoing_it_back_keeps_the_thread(self, api: Harness) -> None:
+        first = await api.client.post("/chat", **_ask(), headers={"Origin": ORIGIN})
+        token = first.json()["session_id"]
+
+        second = await api.client.post(
+            "/chat",
+            **_ask("and check-out?", session_id=token),
+            headers={"Origin": ORIGIN},
+        )
+        assert second.json()["session_id"] == token
+
+    async def test_a_chosen_session_id_is_replaced(self, api: Harness) -> None:
+        """The whole point. A caller who can name the thread can file their
+        turns into somebody else's conversation."""
+        response = await api.client.post(
+            "/chat",
+            **_ask(session_id="someone-elses-thread"),
+            headers={"Origin": ORIGIN},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["session_id"] != "someone-elses-thread"
+
+    async def test_another_propertys_token_does_not_carry_over(
+        self, api: Harness
+    ) -> None:
+        theirs = sessions.issue_session("glass-hotel", api.settings)
+        response = await api.client.post(
+            "/chat", **_ask(session_id=theirs.token), headers={"Origin": ORIGIN}
+        )
+        assert response.json()["session_id"] != theirs.token
+
+    async def test_the_stream_hands_it_over_first(self, api: Harness) -> None:
+        """Before any model work: a stream that dies halfway should still
+        leave the Visitor in a thread."""
+        api.pipeline.fail_stream_after = 0
+        response = await api.client.post(
+            "/chat/stream", **_ask(), headers={"Origin": ORIGIN}
+        )
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert events[0]["type"] == "session"
+        assert events[0]["session_id"]
+        assert events[-1]["type"] == "error"
+
+    async def test_an_over_long_session_id_is_rejected_by_the_schema(
+        self, api: Harness
+    ) -> None:
+        """The field is bounded before any of the above runs - an unbounded
+        one is a free write into whatever reads the log."""
+        response = await api.client.post(
+            "/chat", **_ask(session_id="x" * 65), headers={"Origin": ORIGIN}
+        )
+        assert response.status_code == 422
 
 
 class TestFeedback:

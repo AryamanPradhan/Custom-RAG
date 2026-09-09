@@ -57,6 +57,13 @@ async def lifespan(app: FastAPI):
     gateway.preflight()
     retriever = Retriever(store, dense, sparse, top_k=settings.retrieve_top_k)
 
+    if not settings.session_secret:
+        log.warning(
+            "SESSION_SECRET is unset; session tokens are signed with a "
+            "per-process key. Conversations will be cut at every restart and "
+            "will not hold across containers.",
+        )
+
     chat_log = ChatLog(db)
     if settings.chat_log_enabled:
         # Retention has no scheduler behind it: a deploy is the sweep.
@@ -139,7 +146,31 @@ def create_app() -> FastAPI:
     async def health() -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
-    widget_file = Path(__file__).resolve().parent.parent / "widget" / "src" / "guide.js"
+    widget_dir = Path(__file__).resolve().parent.parent / "widget"
+    widget_file = widget_dir / "src" / "guide.js"
+
+    @app.get("/demo", tags=["ops"], include_in_schema=False)
+    async def demo() -> FileResponse:
+        """A stand-in client site running the real widget.
+
+        The pair to /console: this is what a Visitor sees - the answer, and one
+        line saying how current it is - while the console shows the machinery
+        underneath, source list included.
+        """
+        return FileResponse(widget_dir / "demo.html", media_type="text/html")
+
+    @app.get("/console", tags=["ops"], include_in_schema=False)
+    async def console() -> FileResponse:
+        """An operator test rig for the chat endpoints.
+
+        Served from the API's own origin on purpose: the Origin header is what
+        identifies a Property, so a page served from anywhere else needs its
+        own registration. Nothing is exposed that /chat does not already
+        expose - an origin that is not registered gets the same 403 here as
+        any other caller, which is the first thing this page is useful for
+        seeing.
+        """
+        return FileResponse(widget_dir / "console.html", media_type="text/html")
 
     @app.get("/guide.js", tags=["widget"], include_in_schema=False)
     async def guide_js() -> FileResponse:

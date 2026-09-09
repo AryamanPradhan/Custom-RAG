@@ -1,0 +1,373 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Guide console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<!--
+  An operator test rig, served by the API itself at /console.
+
+  Not widget/demo.html, which stands in for a client's website and shows the
+  one <script> tag that is the whole integration. This shows the machinery
+  instead: what was sent, what came back, which thread it landed in, and why a
+  turn deflected. Everything here is a plain fetch against the public
+  endpoints, so what it exercises is what a visitor's browser exercises.
+
+  The page is served from the API's own origin, and the Origin header is what
+  identifies the Property - so that origin has to be registered:
+
+    guide origins glass-hotel --add http://localhost:8000
+-->
+
+<style>
+  :root {
+    --bg: #fbfbfa; --panel: #fff; --line: #e6e4e0; --ink: #1a1a1a;
+    --dim: #6b6b6b; --accent: #1a5f4a; --warn: #b4451f; --code: #f4f3f1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c; --panel: #1c1f24; --line: #2a2e35; --ink: #e8e8e8;
+      --dim: #9a9a9a; --accent: #4fb08d; --warn: #e08a63; --code: #23262c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap;
+    padding: .7rem 1rem; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 { font-size: .95rem; margin: 0; font-weight: 600; }
+  header .origin { color: var(--dim); font-size: .8rem; font-family: ui-monospace, monospace; }
+  header .spacer { flex: 1; }
+  label.mode { color: var(--dim); font-size: .8rem; display: flex; align-items: center; gap: .35rem; }
+  button, select {
+    font: inherit; font-size: .82rem; padding: .3rem .6rem; border-radius: 5px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--accent); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 22rem; min-height: 0; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } aside { display: none; } }
+
+  #chat { display: flex; flex-direction: column; min-height: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 1rem; }
+  .turn { max-width: 42rem; margin: 0 auto .9rem; }
+  .who { font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); margin-bottom: .2rem; }
+  .bubble { white-space: pre-wrap; }
+  .turn.visitor .bubble { color: var(--ink); font-weight: 500; }
+  .turn.error .bubble { color: var(--warn); }
+  .cites { margin-top: .45rem; font-size: .8rem; color: var(--dim); }
+  .cites div { margin-top: .15rem; }
+  .flags { margin-top: .35rem; font-size: .72rem; color: var(--dim); font-family: ui-monospace, monospace; }
+  .flags .bad { color: var(--warn); }
+
+  form { display: flex; gap: .5rem; padding: .75rem 1rem; border-top: 1px solid var(--line); background: var(--panel); }
+  form input {
+    flex: 1; font: inherit; padding: .5rem .7rem; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  form input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  form button { padding: .5rem 1rem; }
+
+  aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 1rem; }
+  aside h2 { font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); margin: 1.2rem 0 .4rem; }
+  aside h2:first-child { margin-top: 0; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: .15rem .6rem; font-size: .8rem; }
+  dt { color: var(--dim); }
+  dd { margin: 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+  #events { font-family: ui-monospace, monospace; font-size: .74rem; color: var(--dim); }
+  #events div { padding: .1rem 0; border-bottom: 1px solid var(--line); }
+  #events .t { color: var(--accent); }
+  .hint { font-size: .78rem; color: var(--dim); margin: .5rem 0 0; }
+  .hint code { background: var(--code); padding: .05em .3em; border-radius: 3px; }
+</style>
+
+<header>
+  <h1>Guide console</h1>
+  <span class="origin" id="origin"></span>
+  <span class="spacer"></span>
+  <label class="mode">
+    endpoint
+    <select id="mode">
+      <option value="stream">/chat/stream</option>
+      <option value="json">/chat</option>
+    </select>
+  </label>
+  <button id="reset" title="Forget the session token and the transcript">new session</button>
+</header>
+
+<main>
+  <div id="chat">
+    <div id="log"></div>
+    <form id="form">
+      <input id="q" placeholder="Ask the Guide something…" autocomplete="off" autofocus>
+      <button>Send</button>
+    </form>
+  </div>
+
+  <aside>
+    <h2>Last turn</h2>
+    <dl>
+      <dt>mode</dt><dd id="i-mode">—</dd>
+      <dt>status</dt><dd id="i-status">—</dd>
+      <dt>latency</dt><dd id="i-ms">—</dd>
+      <dt>deflected</dt><dd id="i-deflected">—</dd>
+      <dt>grounded</dt><dd id="i-grounded">—</dd>
+      <dt>trace</dt><dd id="i-trace">—</dd>
+    </dl>
+
+    <h2>Session</h2>
+    <dl>
+      <dt>thread</dt><dd id="i-thread">—</dd>
+      <dt>reissued</dt><dd id="i-reissued">—</dd>
+      <dt>history</dt><dd id="i-history">0 turns</dd>
+    </dl>
+    <p class="hint">
+      History is carried here, not on the server — it is sent back with every
+      turn. <code>new session</code> drops both.
+    </p>
+
+    <h2>Events</h2>
+    <div id="events"></div>
+  </aside>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const SESSION_KEY = "guide:console:session";
+
+  let history = [];
+  let sessionId = null;
+  try { sessionId = sessionStorage.getItem(SESSION_KEY); } catch { /* private mode */ }
+
+  $("origin").textContent = location.origin;
+
+  function set(id, value, bad = false) {
+    const el = $(id);
+    el.textContent = value;
+    el.style.color = bad ? "var(--warn)" : "";
+  }
+
+  function shorten(token) {
+    return token ? token.split(".")[0] : "—";
+  }
+
+  function adopt(token) {
+    if (!token) return;
+    const reissued = sessionId !== null && token !== sessionId;
+    sessionId = token;
+    try { sessionStorage.setItem(SESSION_KEY, token); } catch { /* nothing to do */ }
+    set("i-thread", shorten(token));
+    set("i-reissued", reissued ? "yes — server replaced it" : "no", reissued);
+  }
+
+  function event(type, detail = "") {
+    const row = document.createElement("div");
+    row.innerHTML = `<span class="t"></span> `;
+    row.firstChild.textContent = type;
+    row.append(detail);
+    $("events").prepend(row);
+  }
+
+  function turn(who, text, cssClass = "") {
+    const wrap = document.createElement("div");
+    wrap.className = `turn ${cssClass || who}`;
+    const label = document.createElement("div");
+    label.className = "who";
+    label.textContent = who;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    wrap.append(label, bubble);
+    $("log").append(wrap);
+    $("log").scrollTop = $("log").scrollHeight;
+    return wrap;
+  }
+
+  function citations(wrap, cites) {
+    if (!cites || !cites.length) return;
+    const box = document.createElement("div");
+    box.className = "cites";
+    for (const c of cites) {
+      const line = document.createElement("div");
+      const age = c.published_on ? ` — as published ${c.published_on}` : "";
+      line.textContent = `${c.label}${age}`;
+      box.append(line);
+    }
+    wrap.append(box);
+  }
+
+  function flags(wrap, { deflected, grounded, traceId }) {
+    const box = document.createElement("div");
+    box.className = "flags";
+    const bits = [];
+    if (deflected) bits.push('<span class="bad">deflected</span>');
+    if (grounded === false) bits.push('<span class="bad">ungrounded</span>');
+    if (traceId) bits.push(`trace ${traceId}`);
+    if (!bits.length) return;
+    box.innerHTML = bits.join(" · ");
+    wrap.append(box);
+  }
+
+  async function errorText(response) {
+    // 403 unregistered origin, 429 rate limit or spend cap, 422 bad payload -
+    // each is a thing worth testing, so show what the API actually said.
+    try {
+      const body = await response.json();
+      return `${response.status} — ${body.detail || JSON.stringify(body)}`;
+    } catch {
+      return `${response.status} ${response.statusText}`;
+    }
+  }
+
+  function body(question) {
+    return JSON.stringify({
+      message: question,
+      history: history.slice(-12),
+      session_id: sessionId,
+    });
+  }
+
+  async function askJson(question) {
+    const response = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body(question),
+    });
+    set("i-status", response.status, !response.ok);
+    if (!response.ok) {
+      turn("error", await errorText(response), "error");
+      return null;
+    }
+
+    const data = await response.json();
+    adopt(data.session_id);
+    const wrap = turn("guide", data.answer);
+    citations(wrap, data.citations);
+    flags(wrap, { deflected: data.deflected, grounded: data.grounded, traceId: data.trace_id });
+    set("i-deflected", String(data.deflected));
+    set("i-grounded", String(data.grounded), data.grounded === false);
+    set("i-trace", data.trace_id || "—");
+    event("done", ` deflected=${data.deflected}`);
+    return data.deflected ? null : data.answer;
+  }
+
+  async function askStream(question) {
+    const response = await fetch("/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body(question),
+    });
+    set("i-status", response.status, !response.ok);
+    if (!response.ok || !response.body) {
+      turn("error", await errorText(response), "error");
+      return null;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let wrap = null;
+    let text = "";
+    let answered = true;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        let e;
+        try { e = JSON.parse(line.slice(6)); } catch { continue; }
+
+        if (e.type === "session") {
+          adopt(e.session_id);
+          event("session", ` ${shorten(e.session_id)}`);
+        } else if (e.type === "token") {
+          if (!wrap) wrap = turn("guide", "");
+          text += e.text;
+          wrap.querySelector(".bubble").textContent = text;
+          $("log").scrollTop = $("log").scrollHeight;
+        } else if (e.type === "deflect" || e.type === "retract") {
+          // retract is the one worth watching: tokens already streamed and
+          // are being thrown away because the grounding check failed.
+          event(e.type, ` ${e.reason || ""}`);
+          text = e.answer;
+          if (!wrap) wrap = turn("guide", "");
+          wrap.querySelector(".bubble").textContent = text;
+          answered = false;
+        } else if (e.type === "replace") {
+          text = e.answer;
+          wrap.querySelector(".bubble").textContent = text;
+          event("replace", " output guard rewrote the answer");
+        } else if (e.type === "citations") {
+          if (wrap) citations(wrap, e.citations);
+          event("citations", ` ${e.citations.length}`);
+        } else if (e.type === "done") {
+          set("i-deflected", String(e.deflected));
+          set("i-grounded", answered ? "true" : "false", !answered);
+          set("i-trace", e.trace_id || "—");
+          if (wrap) flags(wrap, { deflected: e.deflected, grounded: answered, traceId: e.trace_id });
+          event("done", ` deflected=${e.deflected}`);
+        } else if (e.type === "error") {
+          turn("error", e.message, "error");
+          event("error", ` ${e.message}`);
+          answered = false;
+        }
+      }
+    }
+    return answered ? text : null;
+  }
+
+  $("form").addEventListener("submit", async (submitted) => {
+    submitted.preventDefault();
+    const question = $("q").value.trim();
+    if (!question) return;
+
+    $("q").value = "";
+    $("q").disabled = true;
+    turn("visitor", question);
+    $("events").innerHTML = "";
+
+    const mode = $("mode").value;
+    set("i-mode", mode);
+    const started = performance.now();
+    try {
+      const answer = mode === "json" ? await askJson(question) : await askStream(question);
+      if (answer) {
+        history.push({ role: "user", content: question });
+        history.push({ role: "assistant", content: answer });
+        $("i-history").textContent = `${history.length} turns`;
+      }
+    } catch (err) {
+      turn("error", `Could not reach the API: ${err.message}`, "error");
+    } finally {
+      set("i-ms", `${Math.round(performance.now() - started)} ms`);
+      $("q").disabled = false;
+      $("q").focus();
+    }
+  });
+
+  $("reset").addEventListener("click", () => {
+    history = [];
+    sessionId = null;
+    try { sessionStorage.removeItem(SESSION_KEY); } catch { /* nothing to do */ }
+    $("log").innerHTML = "";
+    $("events").innerHTML = "";
+    for (const id of ["i-mode", "i-status", "i-ms", "i-deflected", "i-grounded", "i-trace", "i-thread", "i-reissued"]) {
+      set(id, "—");
+    }
+    $("i-history").textContent = "0 turns";
+    $("q").focus();
+  });
+
+  set("i-thread", shorten(sessionId));
+</script>

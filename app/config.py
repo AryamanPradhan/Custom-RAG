@@ -57,6 +57,17 @@ class Settings(BaseSettings):
     # ---- Relational storage ---------------------------------------------
     database_path: str = "data/guide.db"
 
+    # ---- Sessions (Layer 02) --------------------------------------------
+    # Signs the session token the Widget echoes back, so a Visitor cannot pick
+    # the thread their turns are logged under. Unset means a per-process key:
+    # every restart and every extra container cuts conversations in flight,
+    # which is fine on a laptop and wrong in a deployment.
+    session_secret: str | None = None
+    # How long an issued token stays valid. Conversations on a hotel website
+    # last minutes; this is generous so a visitor who leaves a tab open
+    # overnight comes back to the same thread. 0 = never expires.
+    session_max_age_hours: int = 24
+
     # ---- Chat log (Layer 09) --------------------------------------------
     # One row per served turn: what was asked, what was answered, why it
     # deflected. Off makes the service keep nothing about a Visitor at all,
@@ -67,8 +78,9 @@ class Settings(BaseSettings):
     chat_log_retention_days: int = 90
 
     # ---- Ingestion ------------------------------------------------------
-    # Uploads are the only way content enters a Corpus.
-    upload_dir: str = "data/uploads"
+    # Uploads are the only way content enters a Corpus. Nothing is written to
+    # disk on the way in - the bytes go from the request straight to the
+    # loader - so there is no upload directory to configure.
     max_upload_mb: int = 25
 
     # ---- Chunking + retrieval -------------------------------------------
@@ -102,6 +114,13 @@ class Settings(BaseSettings):
     logfire_environment: str = "dev"
     rate_limit_per_minute: int = 12
     rate_limit_burst: int = 5
+    # How many reverse proxies sit in front of this process. 0 means none, and
+    # X-Forwarded-For is ignored entirely - the header is client-supplied, so
+    # trusting it without a proxy in front lets a caller mint a fresh rate
+    # limit bucket per request just by varying it. Set it to the real hop
+    # count (1 behind a single load balancer) and only the entry that proxy
+    # appended is read.
+    trusted_proxy_hops: int = 0
     default_daily_spend_cap_usd: float = 5.0
 
     # Ceilings under *every* model call - chat, ingestion, eval, embeddings.
@@ -126,3 +145,16 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def default_spend_cap_usd() -> float:
+    """The per-Property daily cap to apply when a caller does not name one.
+
+    Read through a function rather than copied as a literal into each default.
+    The number had been written out at the Pydantic request model, the Property
+    dataclass, the repository's `create`, the CLI's `--cap` and the table
+    definition - five defaults that could disagree, and a configured
+    DEFAULT_DAILY_SPEND_CAP_USD that none of them read. Callable defaults
+    resolve per call, so changing the setting changes every site at once.
+    """
+    return get_settings().default_daily_spend_cap_usd

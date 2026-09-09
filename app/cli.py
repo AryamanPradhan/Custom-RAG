@@ -10,6 +10,7 @@ supplied, ask the Guide a question, run the eval set.
     guide ask casa-verde "can I bring my dog?"
     guide eval casa-verde ./evals/casa-verde.json
     guide logs casa-verde --deflected        # what the corpus could not answer
+    guide origins casa-verde --add http://localhost:8000
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from app.retrieval.retriever import Retriever
 from app.retrieval.store import VectorStore
 from app.storage.chat_log import ChatLog
 from app.storage.db import close_db, init_db
-from app.storage.properties import ContactRoute, PropertyRepository
+from app.storage.properties import ContactRoute, PropertyRepository, normalise_origin
 
 
 class _Context:
@@ -242,6 +243,51 @@ async def _eval(args) -> int:
         await close_db()
 
 
+async def _origins(args) -> int:
+    """Show, add to or remove from a Property's origin allowlist.
+
+    The allowlist is the only thing identifying which client an anonymous
+    request belongs to, so it needed a way to change after onboarding - a
+    client moving to a new domain, or a test page served from a new port.
+    """
+    ctx = await _build(need_embeddings=False)
+    try:
+        prop = await ctx.repo.get(args.property_id)
+        if prop is None:
+            print(f"No such property: {args.property_id}", file=sys.stderr)
+            return 1
+
+        origins = list(prop.allowed_origins)
+        for raw in args.add or []:
+            origin = normalise_origin(raw)
+            if not origin:
+                print(f"Not a usable origin: {raw}", file=sys.stderr)
+                return 1
+            if origin not in origins:
+                origins.append(origin)
+        for raw in args.remove or []:
+            origin = normalise_origin(raw)
+            if origin in origins:
+                origins.remove(origin)
+
+        if not origins:
+            # Removing the last one would leave the Property unreachable by
+            # every caller, which is a mistake rather than a configuration.
+            print("A property needs at least one origin.", file=sys.stderr)
+            return 1
+
+        if origins != prop.allowed_origins:
+            await ctx.repo.set_origins(args.property_id, origins)
+
+        print(f"{prop.property_id} answers requests from:")
+        for origin in origins:
+            print(f"  {origin}")
+        return 0
+    finally:
+        await ctx.store.close()
+        await close_db()
+
+
 async def _logs(args) -> int:
     """Read the chat log back. No models, no vector store - just the table."""
     ctx = await _build(need_embeddings=False)
@@ -286,7 +332,12 @@ def main() -> int:
     p.add_argument("--phone")
     p.add_argument("--email")
     p.add_argument("--url")
-    p.add_argument("--cap", type=float, default=5.0, help="daily spend cap in USD")
+    # No default here: None reaches the repository, which resolves it from
+    # DEFAULT_DAILY_SPEND_CAP_USD like every other caller.
+    p.add_argument(
+        "--cap", type=float, default=None,
+        help="daily spend cap in USD (default: DEFAULT_DAILY_SPEND_CAP_USD)",
+    )
     p.set_defaults(func=_onboard)
 
     p = sub.add_parser("upload", help="index documents the owner supplied")
@@ -298,6 +349,12 @@ def main() -> int:
     p.add_argument("property_id")
     p.add_argument("question")
     p.set_defaults(func=_ask)
+
+    p = sub.add_parser("origins", help="show or change a property's origin allowlist")
+    p.add_argument("property_id")
+    p.add_argument("--add", action="append", help="origin to allow; repeatable")
+    p.add_argument("--remove", action="append", help="origin to drop; repeatable")
+    p.set_defaults(func=_origins)
 
     p = sub.add_parser("logs", help="read the chat log for a property")
     p.add_argument("property_id")

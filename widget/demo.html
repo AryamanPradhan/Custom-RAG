@@ -32,9 +32,10 @@
 </p>
 
 <!--
-  Served from http://localhost:5500, talking to the API on :8000. The Origin
-  header is what identifies the property, so :5500 must be registered:
+  The API serves this page at /demo, so the script tag is same-origin and the
+  Origin header already resolves to a registered property. Served from anywhere
+  else - a Live Server on :5500, say - that origin needs registering first:
 
-    guide onboard glass-hotel "The Glass Hotel" --origin http://localhost:5500
+    guide origins glass-hotel --add http://localhost:5500
 -->
-<script src="http://localhost:8000/guide.js" data-property-id="glass-hotel"></script>
+<script src="/guide.js" data-property-id="glass-hotel"></script>
