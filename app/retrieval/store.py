@@ -301,13 +301,3 @@ def _to_scored(point) -> ScoredChunk:
         },
     )
     return ScoredChunk(chunk=chunk, score=float(point.score))
-
-
-_store: VectorStore | None = None
-
-
-def get_store() -> VectorStore:
-    global _store
-    if _store is None:
-        _store = VectorStore()
-    return _store

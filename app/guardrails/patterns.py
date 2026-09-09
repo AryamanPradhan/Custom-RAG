@@ -140,7 +140,13 @@ def neutralise_injection(text: str) -> tuple[str, list[str]]:
 # PII
 # ---------------------------------------------------------------------------
 
-_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]{2,}")
+# Both sides of the @ are bounded. An unbounded `[\w.+-]+` prefix makes this
+# quadratic on any long run of word characters: it consumes to the end of the
+# run, fails to find an @, and restarts one character along. A 4000-character
+# message - the schema's own limit - cost 170ms, and a full history of them
+# blocked the event loop for 3.4 seconds before any model was called. The
+# bounds are RFC 5321's: 64 for the local part, 255 for a domain.
+_EMAIL = re.compile(r"[\w.+-]{1,64}@[\w-]{1,255}\.[\w.-]{2,}")
 _CARD_CANDIDATE = re.compile(r"\b(?:\d[ -]?){12,22}\d\b")
 _PHONE_CANDIDATE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
 

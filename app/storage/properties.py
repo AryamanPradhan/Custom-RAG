@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
+from app.config import default_spend_cap_usd
 from app.storage.db import Database
 
 
@@ -84,7 +85,7 @@ class Property:
     property_id: str
     display_name: str
     contact_route: ContactRoute = field(default_factory=ContactRoute)
-    daily_spend_cap_usd: float = 5.0
+    daily_spend_cap_usd: float = field(default_factory=default_spend_cap_usd)
     last_ingested_at: str | None = None
     active: bool = True
     allowed_origins: list[str] = field(default_factory=list)
@@ -103,8 +104,10 @@ class PropertyRepository:
         *,
         allowed_origins: list[str],
         contact_route: ContactRoute | None = None,
-        daily_spend_cap_usd: float = 5.0,
+        daily_spend_cap_usd: float | None = None,
     ) -> Property:
+        if daily_spend_cap_usd is None:
+            daily_spend_cap_usd = default_spend_cap_usd()
         now = datetime.now(UTC).isoformat()
         await self._db.conn.execute(
             """INSERT INTO properties

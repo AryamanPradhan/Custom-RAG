@@ -23,6 +23,33 @@ from app.config import Settings
 _enabled = False
 _configured = False
 
+# Span attributes of ours that collide with Logfire's default patterns. The
+# scrubber matches on field *name*, and "session" is one of its patterns, so
+# `session_id` - a thread key, not a credential - would export as a redaction
+# and make the traces unreadable for the one question they are kept to answer.
+_OUR_OWN_FIELD_NAMES = frozenset({"session_id", "thread_id"})
+
+
+def _keep_our_own_field_names(match: logfire.ScrubMatch) -> Any:
+    """Suppress the false positives, and let everything else redact.
+
+    Scrubbing stays *on* because `configure()` governs more than `span()`.
+    `instrument_fastapi` records request data, headers included, so with the
+    scrubber off an `X-Admin-Key` reached the exporter in clear text; the same
+    applies to every structlog field forwarded through StructlogProcessor.
+    Switching it off wholesale to keep one field name readable was too broad a
+    fix for too narrow a problem.
+
+    Note what this does *not* cover: Logfire exempts `logfire.openai` and
+    `logfire.anthropic` spans from scrubbing itself, so prompts and completions
+    are exported as-is whatever this is set to. Keeping a Visitor's question
+    out of Logfire is a decision about whether to call `instrument_openai` at
+    all, not one this callback can make.
+    """
+    if match.path and str(match.path[-1]) in _OUR_OWN_FIELD_NAMES:
+        return match.value
+    return None
+
 
 def configure_logfire(settings: Settings, *, service: str) -> bool:
     """Configure the SDK once per process. Returns True if traces are exported.
@@ -45,9 +72,7 @@ def configure_logfire(settings: Settings, *, service: str) -> bool:
         # structlog owns the terminal (see logging_setup). Leaving this on
         # would print every span twice, in two different formats.
         console=False,
-        # The values passed to span() are ours and already short; the scrubber
-        # would rewrite ordinary field names like "session_id" into redactions.
-        scrubbing=False,
+        scrubbing=logfire.ScrubbingOptions(callback=_keep_our_own_field_names),
     )
     _configured = True
     # Not `bool(settings.logfire_token)`: `logfire projects new` writes a token
@@ -86,10 +111,6 @@ def instrument_providers() -> None:
 def structlog_processor():
     """Every structlog event, forwarded to Logfire with its fields intact."""
     return logfire.StructlogProcessor()
-
-
-def logfire_enabled() -> bool:
-    return _enabled
 
 
 @contextmanager

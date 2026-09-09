@@ -12,6 +12,8 @@ prompt, and read by the model as though the operator wrote it.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.guardrails.input_guard import (
@@ -224,3 +226,37 @@ class TestAnswerScrubbing:
     def test_clean_answer_is_untouched(self) -> None:
         answer = "Check-in is from 2pm."
         assert scrub_answer(answer, trusted_text=self.SOURCES) == answer
+
+
+class TestGuardCost:
+    """The guards run before any model call, so the spend caps do not bound
+    them - only the rate limit does, and they block the event loop while they
+    run. A message that is expensive to *screen* is therefore a denial of
+    service that costs the sender one request."""
+
+    WORST = "4" * 4000          # the schema's max message length
+    HISTORY = 20                # the schema's max history length
+
+    def test_screening_a_max_length_message_stays_cheap(self) -> None:
+        started = time.perf_counter()
+        check_message(self.WORST)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        # An unbounded prefix on the email pattern put this at 170ms: it
+        # consumed the whole digit run, failed to find an @, and restarted one
+        # character along. The budget is far above the ~6ms it now takes and
+        # far below what quadratic scanning costs.
+        assert elapsed_ms < 60
+
+    def test_screening_a_full_history_stays_cheap(self) -> None:
+        history = [{"role": "user", "content": self.WORST} for _ in range(self.HISTORY)]
+        started = time.perf_counter()
+        check_history(history)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        # This was 3.3 seconds of blocked event loop, from one request whose
+        # every field is inside the schema's own limits.
+        assert elapsed_ms < 800
+
+    def test_bounding_the_email_pattern_did_not_change_what_it_finds(self) -> None:
+        assert detect_pii("write to info@casa-verde.com") == ["email"]
+        assert detect_pii("first.last+tag@sub.example.com") == ["email"]
+        assert detect_pii("no address here") == []

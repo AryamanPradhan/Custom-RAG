@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS properties (
     property_id          TEXT PRIMARY KEY,
     display_name         TEXT NOT NULL,
     contact_route        TEXT,           -- JSON: {phone, email, url, note}
-    daily_spend_cap_usd  REAL NOT NULL DEFAULT 5.0,
+    -- No DEFAULT: every insert goes through PropertyRepository.create,
+    -- which resolves the cap from settings. A default here would be a
+    -- sixth copy of the number that nothing can reach.
+    daily_spend_cap_usd  REAL NOT NULL,
     last_ingested_at     TEXT,
     created_at           TEXT NOT NULL,
     active               INTEGER NOT NULL DEFAULT 1

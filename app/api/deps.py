@@ -102,12 +102,29 @@ def get_repo() -> PropertyRepository:
     return PropertyRepository(get_db())
 
 
-def client_ip(request: Request) -> str:
-    """Behind a proxy the socket peer is the proxy, so prefer the first hop in
-    X-Forwarded-For. Only trust it when a proxy actually sets it."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+def client_ip(request: Request, settings: Settings | None = None) -> str:
+    """The key the rate limiter buckets on.
+
+    X-Forwarded-For is written by the client and appended to by each proxy, so
+    the left-hand entries are whatever the caller chose to send. Reading the
+    first one let a caller vary the header and get a fresh bucket per request,
+    which is the whole limit bypassed. Only the hops a proxy actually appended
+    can be trusted, so TRUSTED_PROXY_HOPS says how many there are and this
+    counts in from the right; with none configured the socket peer is the only
+    honest answer.
+    """
+    settings = settings or get_settings()
+    hops = settings.trusted_proxy_hops
+    if hops > 0:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            chain = [part.strip() for part in forwarded.split(",") if part.strip()]
+            # The last entry is the peer the nearest proxy saw; one hop further
+            # in for each additional proxy. A chain shorter than the configured
+            # hop count means the header did not come from where it should
+            # have, so it is not used at all.
+            if len(chain) >= hops:
+                return chain[-hops]
     return request.client.host if request.client else "unknown"
 
 
@@ -141,7 +158,7 @@ async def resolve_property(
 
     limiter = get_limiter(settings)
     limiter.prune()
-    if not limiter.allow(f"{property_id}:{client_ip(request)}"):
+    if not limiter.allow(f"{property_id}:{client_ip(request, settings)}"):
         METRICS.incr("admission.rejected", reason="rate_limit")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

@@ -307,19 +307,3 @@ class LLMGateway:
 
         if self._on_spend is not None and property_id and cost > 0:
             await self._on_spend(property_id, cost)
-
-
-_gateway: LLMGateway | None = None
-
-
-def get_gateway() -> LLMGateway:
-    global _gateway
-    if _gateway is None:
-        _gateway = LLMGateway()
-    return _gateway
-
-
-def set_gateway(gateway: LLMGateway) -> None:
-    """Used by the app lifespan to install a gateway wired to the spend ledger."""
-    global _gateway
-    _gateway = gateway
