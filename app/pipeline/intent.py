@@ -79,6 +79,13 @@ _FILLER = {
 
 _SMALLTALK = _GREETING | _WELLBEING | _THANKS | _FAREWELL | _FILLER
 
+# What may sit in front of a question about the Guide without changing it.
+# Deliberately not the whole filler set: 'help' is filler *and* a capability
+# question on its own, and stripping it would leave nothing to match.
+_LEAD_IN = _GREETING | {
+    "good", "there", "please", "so", "and", "hey", "ok", "okay", "um", "erm",
+}
+
 # Apostrophes and emoji are noise for this decision; digits are not - "hi 2"
 # is odd enough to send down the normal path.
 _NORMALISE = re.compile(r"[^a-z\s]+")
@@ -93,7 +100,22 @@ def classify_intent(message: str) -> Intent:
 
     # Checked before the vocabulary, because "what can you do" is built from
     # words the bag would not otherwise recognise.
-    if _CAPABILITY.fullmatch(" ".join(tokens)):
+    joined = " ".join(tokens)
+    if _CAPABILITY.fullmatch(joined):
+        return Intent.CAPABILITY
+
+    # A greeting in front of a question about the Guide is still a question
+    # about the Guide. "hi, who are you?" opened the widget, went to
+    # retrieval, found nothing, and told someone who had just said hello to
+    # phone the hotel - the exact first impression this module exists to
+    # prevent, missed because the greeting broke a whole-string match.
+    #
+    # Only leading tokens are dropped, and only after the match above has been
+    # tried on the whole message, so a bare "help" still answers as one.
+    lead = 0
+    while lead < len(tokens) and tokens[lead] in _LEAD_IN:
+        lead += 1
+    if lead and _CAPABILITY.fullmatch(" ".join(tokens[lead:])):
         return Intent.CAPABILITY
 
     if not all(token in _SMALLTALK for token in tokens):

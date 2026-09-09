@@ -88,6 +88,56 @@ class TestQuestionsAreNeverSmalltalk:
         assert classify_intent(message) is Intent.INFORMATIONAL
 
 
+
+class TestAGreetingBeforeACapabilityQuestion:
+    """"hi, who are you?" is the first thing a visitor types, and it used to
+    reach retrieval, find nothing, and tell someone who had just said hello to
+    phone the hotel.
+
+    Two things had to go wrong together: the capability pattern is matched
+    against the whole message, so the greeting broke it, and "who" is not in
+    the smalltalk vocabulary, so the fallback did not catch it either.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "hi who are you",
+            "hi, who are you?",
+            "hey who are you",
+            "hello, what can you do?",
+            "good morning who are you",
+            "hi there, what are you for?",
+            "so what can you do",
+        ],
+    )
+    def test_a_lead_in_does_not_hide_the_question(self, message: str) -> None:
+        assert classify_intent(message) is Intent.CAPABILITY
+
+    @pytest.mark.parametrize("message", ["help", "please help", "menu", "start"])
+    def test_the_bare_forms_still_answer(self, message: str) -> None:
+        """`help` is both filler and a capability question on its own. The
+        whole message is matched first, so stripping never empties it."""
+        assert classify_intent(message) is Intent.CAPABILITY
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "hi what time is check-in?",
+            "hello, is there parking?",
+            "who owns the hotel?",
+            "who is the manager",
+            "what are your rates",
+            "good morning, can I book a spa treatment?",
+        ],
+    )
+    def test_a_real_question_is_still_a_real_question(self, message: str) -> None:
+        """The safe direction is unchanged: anything that is not clearly about
+        the Guide itself goes to retrieval. A greeting misread as a question
+        costs one formal answer; a question misread as a greeting costs the
+        visitor the answer entirely."""
+        assert classify_intent(message) is Intent.INFORMATIONAL
+
 class TestReplies:
     @pytest.mark.parametrize(
         "intent", ["greeting", "thanks", "farewell", "capability"]
