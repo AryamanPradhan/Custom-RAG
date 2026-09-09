@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,6 +48,45 @@ STEPS: dict[str, tuple[str, str]] = {
     "embed": ("🧮", "Embedding"),
     "index": ("📚", "Indexing"),
 }
+
+
+# A second reader for completed steps, besides the terminal. The operator
+# console subscribes so a live demo can show the pipeline working during the
+# seconds before the first token, which is otherwise dead air on screen.
+# Unset for every ordinary request: a Visitor's stream carries the answer, not
+# the shape of the machine that produced it.
+_sink: ContextVar[Callable[[dict], None] | None] = ContextVar("step_sink", default=None)
+
+
+@contextmanager
+def step_sink(fn: Callable[[dict], None] | None) -> Iterator[None]:
+    """Subscribe to completed steps for the duration of the block.
+
+    `None` installs nothing, so the caller decides whether a request is
+    observed without branching around this at every call site.
+    """
+    token = _sink.set(fn)
+    try:
+        yield
+    finally:
+        _sink.reset(token)
+
+
+def _publish(s: Span) -> None:
+    fn = _sink.get()
+    if fn is None:
+        return
+    icon, label = STEPS.get(s.name, ("·", s.name))
+    # Observing a turn must never break it: a console that has gone away is
+    # not a reason to fail the answer a Visitor is waiting for.
+    with suppress(Exception):
+        fn({
+            "step": label,
+            "icon": icon,
+            "ms": s.duration_ms,
+            "summary": s.error or s.summary,
+            "error": bool(s.error),
+        })
 
 
 @dataclass
@@ -144,6 +184,7 @@ def span(name: str, **attributes: Any):
                 # Re-set: the body may have attached results mid-flight.
                 exported.set_attributes(s.attributes)
             _announce(s)
+            _publish(s)
 
 
 def _announce(s: Span) -> None:

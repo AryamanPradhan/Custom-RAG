@@ -85,6 +85,16 @@
   #events .t { color: var(--accent); }
   .hint { font-size: .78rem; color: var(--dim); margin: .5rem 0 0; }
   .hint code { background: var(--code); padding: .05em .3em; border-radius: 3px; }
+  .steps { list-style: none; margin: 0 0 1rem; padding: 0; font-size: 12px; }
+  .steps li { display: flex; gap: .45rem; align-items: baseline;
+              padding: .3rem 0; border-bottom: 1px solid var(--line); }
+  .steps li:last-child { border-bottom: 0; }
+  .steps .icon { flex: none; }
+  .steps .name { color: var(--ink); font-weight: 500; }
+  .steps .ms { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .steps .sum { flex-basis: 100%; color: var(--dim); line-height: 1.35; }
+  .steps li.bad .name { color: var(--warn); }
+  .steps li.none { color: var(--dim); border-bottom: 0; }
 </style>
 
 <header>
@@ -97,6 +107,11 @@
       <option value="stream">/chat/stream</option>
       <option value="json">/chat</option>
     </select>
+  </label>
+  <label class="mode">
+    admin key
+    <input id="adminkey" type="password" placeholder="for the step trace" size="14"
+           title="Sent as X-Admin-Key. With it the stream also carries the pipeline steps.">
   </label>
   <button id="reset" title="Forget the session token and the transcript">new session</button>
 </header>
@@ -120,6 +135,9 @@
       <dt>grounded</dt><dd id="i-grounded">—</dd>
       <dt>trace</dt><dd id="i-trace">—</dd>
     </dl>
+
+    <h2>Pipeline</h2>
+    <ol id="steps" class="steps"><li class="none">no step trace — add the admin key</li></ol>
 
     <h2>Session</h2>
     <dl>
@@ -225,6 +243,54 @@
     }
   }
 
+  const ADMIN_KEY_STORE = "guide-console-admin-key";
+
+  function adminKey() {
+    return $("adminkey").value.trim();
+  }
+
+  function headers() {
+    const h = { "Content-Type": "application/json" };
+    // Only the operator holds this. Without it the server sends the same six
+    // event types a Visitor's widget gets, and the panel stays empty.
+    const key = adminKey();
+    if (key) h["X-Admin-Key"] = key;
+    return h;
+  }
+
+  function resetSteps(message) {
+    const list = $("steps");
+    list.innerHTML = "";
+    if (message) {
+      const li = document.createElement("li");
+      li.className = "none";
+      li.textContent = message;
+      list.append(li);
+    }
+  }
+
+  function step(e) {
+    const list = $("steps");
+    const placeholder = list.querySelector(".none");
+    if (placeholder) placeholder.remove();
+    const li = document.createElement("li");
+    if (e.error) li.className = "bad";
+    const icon = document.createElement("span");
+    icon.className = "icon";
+    icon.textContent = e.icon || "·";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = e.step;
+    const ms = document.createElement("span");
+    ms.className = "ms";
+    ms.textContent = e.ms == null ? "" : `${Math.round(e.ms)} ms`;
+    const sum = document.createElement("span");
+    sum.className = "sum";
+    sum.textContent = e.summary || "";
+    li.append(icon, name, ms, sum);
+    list.append(li);
+  }
+
   function body(question) {
     return JSON.stringify({
       message: question,
@@ -236,7 +302,7 @@
   async function askJson(question) {
     const response = await fetch("/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers(),
       body: body(question),
     });
     set("i-status", response.status, !response.ok);
@@ -260,7 +326,7 @@
   async function askStream(question) {
     const response = await fetch("/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers(),
       body: body(question),
     });
     set("i-status", response.status, !response.ok);
@@ -291,6 +357,8 @@
         if (e.type === "session") {
           adopt(e.session_id);
           event("session", ` ${shorten(e.session_id)}`);
+        } else if (e.type === "step") {
+          step(e);
         } else if (e.type === "token") {
           if (!wrap) wrap = turn("guide", "");
           text += e.text;
@@ -327,6 +395,20 @@
     return answered ? text : null;
   }
 
+  try {
+    const saved = sessionStorage.getItem(ADMIN_KEY_STORE);
+    if (saved) $("adminkey").value = saved;
+  } catch { /* private window; the field just starts empty */ }
+
+  $("adminkey").addEventListener("change", () => {
+    // sessionStorage, not localStorage: the key should not outlive the tab.
+    try {
+      const key = adminKey();
+      if (key) sessionStorage.setItem(ADMIN_KEY_STORE, key);
+      else sessionStorage.removeItem(ADMIN_KEY_STORE);
+    } catch { /* nothing to do */ }
+  });
+
   $("form").addEventListener("submit", async (submitted) => {
     submitted.preventDefault();
     const question = $("q").value.trim();
@@ -339,6 +421,13 @@
 
     const mode = $("mode").value;
     set("i-mode", mode);
+    resetSteps(
+      mode === "json"
+        ? "the step trace rides on /chat/stream only"
+        : adminKey()
+          ? "waiting…"
+          : "no step trace — add the admin key"
+    );
     const started = performance.now();
     try {
       const answer = mode === "json" ? await askJson(question) : await askStream(question);

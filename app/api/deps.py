@@ -220,6 +220,19 @@ async def require_admin(
         )
 
 
+def admin_key_ok(x_admin_key: str | None) -> bool:
+    """Whether a key is the admin key, as a question rather than a gate.
+
+    `require_admin` refuses a request; this reports. It is for surfaces that
+    stay open to everyone but show an operator more - the step trace on the
+    chat stream - where absence is the ordinary case and not an error.
+    """
+    settings = get_settings()
+    if not x_admin_key or settings.admin_api_key == PLACEHOLDER_ADMIN_KEY:
+        return False
+    return secrets.compare_digest(x_admin_key, settings.admin_api_key)
+
+
 def make_spend_recorder(repo: PropertyRepository):
     """Bridges the gateway's cost accounting to the ledger."""
 

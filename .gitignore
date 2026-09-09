@@ -27,3 +27,7 @@ data/guide.db-shm
 # Coverage data - regenerate, never commit
 .coverage
 htmlcov/
+
+# Corpus snapshot - the Sources it was built from are gone, so this is not
+# regenerable. Keep it off GitHub: it is a client's content.
+data/corpus-backup.jsonl.gz

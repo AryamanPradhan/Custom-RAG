@@ -26,6 +26,7 @@ from app.config import Settings
 from app.gateway.budget import UsageLimiter, set_usage_limiter
 from app.ingestion.pipeline import IngestReport
 from app.models.domain import Citation, TurnRecord
+from app.observability.tracing import span
 from app.storage.chat_log import ChatLog
 from app.storage.db import Database, close_db, init_db
 from app.storage.properties import ContactRoute, PropertyRepository
@@ -65,6 +66,9 @@ class FakePipeline:
             {"type": "done"},
         ]
         self.fail_stream_after: int | None = None
+        # Step names to run as real spans before the first token, so a test
+        # exercises the tracing sink rather than a stand-in for it.
+        self.steps: list[str] = []
 
     async def answer(self, prop, message, history):
         self.answered.append((prop.property_id, message, history))
@@ -72,6 +76,9 @@ class FakePipeline:
 
     async def stream(self, prop, message, history):
         self.answered.append((prop.property_id, message, history))
+        for name in self.steps:
+            with span(name) as s:
+                s.summary = f"{name} did its work."
         for i, event in enumerate(self.events):
             if self.fail_stream_after is not None and i == self.fail_stream_after:
                 raise RuntimeError("the answer model fell over")
@@ -171,6 +178,15 @@ async def api(tmp_path, monkeypatch):
 
 def _ask(message: str = "when is check-in?", **kwargs):
     return {"json": {"message": message, **kwargs}}
+
+
+def _events(response) -> list[dict]:
+    """The SSE frames of a stream response, in order."""
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
 
 
 class TestAdmission:
@@ -397,6 +413,73 @@ class TestChat:
             "citations",
             "done",
         ]
+
+    async def test_a_visitor_never_receives_the_step_trace(self, api: Harness) -> None:
+        """Step names, timings and candidate counts describe the machine, not
+        the answer. The widget calls this endpoint with no admin key and must
+        get the same six event types it always did."""
+        api.pipeline.steps = ["intent", "plan_query", "retrieve", "rerank"]
+
+        response = await api.client.post(
+            "/chat/stream", **_ask(), headers={"Origin": ORIGIN}
+        )
+
+        kinds = [e["type"] for e in _events(response)]
+        assert "step" not in kinds
+        assert kinds == ["session", "token", "citations", "done"]
+
+    async def test_the_admin_key_adds_the_step_trace(self, api: Harness) -> None:
+        """What the operator console reads. The steps arrive as they finish,
+        before the first token, which is the dead air a live demo shows."""
+        api.pipeline.steps = ["intent", "plan_query", "retrieve", "rerank"]
+
+        response = await api.client.post(
+            "/chat/stream",
+            **_ask(),
+            headers={"Origin": ORIGIN, "X-Admin-Key": ADMIN_KEY},
+        )
+
+        events = _events(response)
+        steps = [e for e in events if e["type"] == "step"]
+        assert [s["step"] for s in steps] == [
+            "Intent",
+            "Planner Decision",
+            "Vector Search",
+            "Reranking",
+        ]
+        assert all(s["icon"] and s["summary"] and not s["error"] for s in steps)
+        assert all(isinstance(s["ms"], (int, float)) for s in steps)
+        # Every step lands before the answer starts, not batched at the end.
+        kinds = [e["type"] for e in events]
+        assert kinds.index("step") < kinds.index("token")
+        assert kinds[-1] == "done"
+
+    async def test_a_wrong_admin_key_grants_no_step_trace(self, api: Harness) -> None:
+        api.pipeline.steps = ["intent"]
+
+        response = await api.client.post(
+            "/chat/stream",
+            **_ask(),
+            headers={"Origin": ORIGIN, "X-Admin-Key": "not-the-key"},
+        )
+
+        assert "step" not in [e["type"] for e in _events(response)]
+
+    async def test_the_placeholder_admin_key_grants_no_step_trace(
+        self, api: Harness
+    ) -> None:
+        """A deployment that never set ADMIN_API_KEY must not hand the trace
+        to anyone who read .env.example."""
+        api.settings.admin_api_key = PLACEHOLDER_ADMIN_KEY
+        api.pipeline.steps = ["intent"]
+
+        response = await api.client.post(
+            "/chat/stream",
+            **_ask(),
+            headers={"Origin": ORIGIN, "X-Admin-Key": PLACEHOLDER_ADMIN_KEY},
+        )
+
+        assert "step" not in [e["type"] for e in _events(response)]
 
     async def test_a_retraction_reaches_the_widget(self, api: Harness) -> None:
         """The event that matters: the answer streamed, then failed the
