@@ -146,12 +146,35 @@ def check_history(history: list[dict]) -> tuple[GuardVerdict, list[dict]]:
     )
 
 
+# The fence is built from angle brackets, so content carrying one can close a
+# block that is not its own. Replaced with U+2039, which reads the same to a
+# person and to a model but cannot begin a tag.
+_LEFT_ANGLE = "‹"
+
+
+def _fenced(value: object) -> str:
+    """Make one value safe to sit inside the fence.
+
+    Applied to every owner-supplied field and not only the chunk body: the
+    title, the heading trail and the uploaded filename are interpolated into
+    the block header, and a Corpus is only as trusted as the last document a
+    client forwarded from someone else.
+    """
+    return str(value).replace("<", _LEFT_ANGLE)
+
+
 def sanitise_context(chunks: list[ScoredChunk]) -> str:
     """Render retrieved Chunks as clearly-delimited, numbered data.
 
     Three defences, in order of importance:
       - every chunk is fenced and numbered, so the model can cite [n] and can
-        tell page content apart from operator instruction
+        tell page content apart from operator instruction. The fence is closed
+        against its own content: a chunk carrying `</source>` would otherwise
+        end its block early and leave the rest of itself where operator
+        instruction goes, and a forged block after it needs no suspicious
+        wording at all - so the pattern list below cannot see it. The same
+        string is read by the grounding verifier, which would then confirm the
+        fabrication as supported.
       - injected instructions inside the content are excised, not passed on
       - the ingest date rides along, because a Corpus changes only when the
         owner sends new material, and an answer
@@ -167,12 +190,18 @@ def sanitise_context(chunks: list[ScoredChunk]) -> str:
         if fired:
             METRICS.incr("guard.injection_neutralised", source="retrieved")
 
-        header = " > ".join(p for p in [chunk.title, *chunk.heading_path] if p)
-        meta = [f"source={chunk.uri}"]
+        if "<" in clean:
+            METRICS.incr("guard.fence_escaped", source="retrieved")
+        clean = _fenced(clean)
+
+        header = " > ".join(
+            _fenced(part) for part in [chunk.title, *chunk.heading_path] if part
+        )
+        meta = [f"source={_fenced(chunk.uri)}"]
         if chunk.fetched_at:
-            meta.append(f"published={chunk.fetched_at}")
+            meta.append(f"published={_fenced(chunk.fetched_at)}")
         if chunk.unit:
-            meta.append(f"unit={chunk.unit}")
+            meta.append(f"unit={_fenced(chunk.unit)}")
 
         blocks.append(
             f"<source index=\"{i}\" {' '.join(meta)}>\n"
