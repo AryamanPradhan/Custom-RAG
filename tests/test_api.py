@@ -344,6 +344,53 @@ class TestAdmission:
         assert api.pipeline.answered == []
 
 
+class TestDevPages:
+    """/demo and /console are development surfaces. /console takes the admin
+    key, so leaving it mounted in a deployment publishes a page that prompts
+    for the one credential that opens uploads and corpus deletion."""
+
+    def _app(self, enabled: bool):
+        from app.config import Settings
+        from app.main import create_app
+        import app.main as main
+
+        settings = Settings(
+            openai_api_key="sk-test",
+            google_api_key="g-test",
+            qdrant_url=":memory:",
+            dev_pages_enabled=enabled,
+        )
+        original = main.get_settings
+        main.get_settings = lambda: settings
+        try:
+            return create_app()
+        finally:
+            main.get_settings = original
+
+    def _paths(self, app) -> set[str]:
+        # Mounted routers appear here too and carry no .path of their own.
+        return {p for p in (getattr(r, "path", None) for r in app.routes) if p}
+
+    def test_the_pages_are_absent_by_default(self) -> None:
+        """Not a 401 to probe - no route at all."""
+        paths = self._paths(self._app(enabled=False))
+        assert "/demo" not in paths
+        assert "/console" not in paths
+
+    def test_the_widget_bundle_is_always_served(self) -> None:
+        """A client site loads /guide.js from here; gating it would break
+        every embed. /health likewise, for the load balancer."""
+        for enabled in (True, False):
+            paths = self._paths(self._app(enabled=enabled))
+            assert "/guide.js" in paths
+            assert "/health" in paths
+
+    def test_the_pages_appear_when_asked_for(self) -> None:
+        paths = self._paths(self._app(enabled=True))
+        assert "/demo" in paths
+        assert "/console" in paths
+
+
 class TestChat:
     async def test_history_reaches_the_pipeline(self, api: Harness) -> None:
         await api.client.post(

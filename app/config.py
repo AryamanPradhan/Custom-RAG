@@ -140,6 +140,11 @@ class Settings(BaseSettings):
     # minute. One is enough to ride out a blip without funding a storm.
     provider_max_retries: int = 1
     admin_api_key: str = "change-me-before-deploying"
+    # /demo and /console. Off unless asked for: they are development surfaces,
+    # and a deployment that does nothing should not publish an operator test
+    # rig that prompts for the admin key. /health and /guide.js are unaffected
+    # - the widget bundle has to be public for a client site to load it.
+    dev_pages_enabled: bool = False
 
 
 @lru_cache(maxsize=1)
