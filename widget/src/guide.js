@@ -395,4 +395,10 @@ if (!customElements.get("hotel-guide")) {
   }
 })();
 
-export { HotelGuide };
+// Deliberately not an ES export. The integration is one plain <script>
+// tag on a client site, and a classic script is the only kind that can
+// read its own data-* attributes: document.currentScript is null inside a
+// module, so autoMount above would find no configuration and never mount.
+// An `export` here made the file a module by syntax alone, which threw
+// "Unexpected token export" before any of it ran.
+window.HotelGuide = HotelGuide;
