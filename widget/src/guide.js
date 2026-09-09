@@ -20,7 +20,15 @@ const STYLES = `
   *, *::before, *::after { box-sizing: border-box; }
 
   .launcher {
-    position: fixed; right: 20px; bottom: 20px; z-index: 2147483000;
+    /* Offsets are custom properties so a host page can move the widget out
+       of the way of its own floating button - most hotel sites already have
+       a WhatsApp or booking bubble in this corner. Custom properties cross
+       the shadow boundary, so the site sets them on :root and nothing else
+       of ours is reachable from outside. */
+    position: fixed;
+    right: var(--guide-right, 20px);
+    bottom: var(--guide-bottom, 20px);
+    z-index: 2147483000;
     width: 56px; height: 56px; border-radius: 50%; border: 0; cursor: pointer;
     background: var(--guide-accent, #1f6feb); color: #fff; font-size: 24px;
     box-shadow: 0 6px 24px rgba(0,0,0,.24);
@@ -28,8 +36,12 @@ const STYLES = `
   .launcher:hover { filter: brightness(1.08); }
 
   .panel {
-    position: fixed; right: 20px; bottom: 88px; z-index: 2147483000;
-    width: min(400px, calc(100vw - 40px)); height: min(560px, calc(100vh - 130px));
+    position: fixed;
+    right: var(--guide-right, 20px);
+    /* Clears the launcher: its 56px plus a 12px gap. */
+    bottom: calc(var(--guide-bottom, 20px) + 68px);
+    z-index: 2147483000;
+    width: min(400px, calc(100vw - 40px)); height: min(560px, calc(100vh - var(--guide-bottom, 20px) - 110px));
     display: flex; flex-direction: column; overflow: hidden;
     background: #fff; color: #1a1a1a; border-radius: 14px;
     border: 1px solid rgba(0,0,0,.1); box-shadow: 0 18px 48px rgba(0,0,0,.22);

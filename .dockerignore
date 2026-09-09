@@ -1,0 +1,27 @@
+# Secrets never enter the image. Railway supplies them as environment
+# variables; a key baked into a layer is a key in every registry copy of it.
+.env
+.env.local
+.logfire/
+
+# Local state. The container gets its own /app/data, on a mounted volume.
+data/
+!data/.gitkeep
+
+# Not needed at runtime.
+tests/
+docs/
+evals/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.git/
+.gitignore
+docker-compose.yml
+*.egg-info/
