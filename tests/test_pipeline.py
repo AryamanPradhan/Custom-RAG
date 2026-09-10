@@ -602,3 +602,83 @@ class TestDedicatedReranker:
         # The listwise path would have gone through complete(Task.RERANK), which
         # this fake records identically - so assert on what it was asked for.
         assert gateway.calls == ["rewrite", "rerank", "answer", "verify"]
+
+
+class TestSmalltalkReplies:
+    """A greeting is generated, not served from a template.
+
+    It is the one reply that reaches a Visitor without a verifier having seen
+    it - there are no sources to check it against - so what these pin down is
+    that it costs no retrieval, that it degrades to the fixed text rather than
+    to nothing, and that the two things it must never carry cannot get out.
+    """
+
+    async def test_a_greeting_is_generated(self, prop: Property) -> None:
+        gateway = FakeGateway(answer="Hello. What would you like to know?")
+        result = await _pipeline(gateway, []).answer(prop, "hi")
+
+        assert result.answer == "Hello. What would you like to know?"
+        assert not result.deflected
+
+    async def test_a_greeting_retrieves_nothing(self, prop: Property) -> None:
+        """The whole reason intent is decided before the planner runs."""
+        gateway = FakeGateway(answer="Hello there.")
+        await _pipeline(gateway, []).answer(prop, "hi")
+
+        assert gateway.calls == ["answer"]
+        assert "rewrite" not in gateway.calls
+        assert "rerank" not in gateway.calls
+        assert "verify" not in gateway.calls
+
+    async def test_capability_is_not_generated(self, prop: Property) -> None:
+        """It describes how the Guide behaves, which is not a matter of
+        opinion for a model to improvise per visitor."""
+        gateway = FakeGateway(answer="I am whatever you would like me to be.")
+        result = await _pipeline(gateway, []).answer(prop, "what can you do")
+
+        assert gateway.calls == []
+        assert "I am whatever" not in result.answer
+        assert "Casa Verde" in result.answer
+
+    async def test_falls_back_to_the_fixed_reply_when_generation_fails(
+        self, prop: Property
+    ) -> None:
+        """A provider outage costs the visitor some warmth, not their reply."""
+
+        class Broken(FakeGateway):
+            async def complete(self, task, **kwargs):
+                raise RuntimeError("provider is down")
+
+        result = await _pipeline(Broken(), []).answer(prop, "hi")
+
+        assert "Casa Verde" in result.answer
+        assert result.answer.rstrip().endswith("?")
+        assert not result.deflected
+
+    async def test_falls_back_when_the_model_returns_nothing(
+        self, prop: Property
+    ) -> None:
+        result = await _pipeline(FakeGateway(answer="   "), []).answer(prop, "hi")
+
+        assert "Casa Verde" in result.answer
+        assert not result.deflected
+
+    async def test_an_invented_phone_number_does_not_reach_the_visitor(
+        self, prop: Property
+    ) -> None:
+        """Nothing is retrieved for a greeting, so a number in one was invented.
+        A visitor would act on it, which is what makes it the worst thing this
+        unverified reply could carry."""
+        gateway = FakeGateway(answer="Hello. Call us on +44 9999 111222 any time.")
+        result = await _pipeline(gateway, []).answer(prop, "hi")
+
+        assert "9999 111222" not in result.answer
+
+    async def test_the_configured_contact_route_survives(
+        self, prop: Property
+    ) -> None:
+        """Scrubbing must not eat the one number the property actually gave."""
+        gateway = FakeGateway(answer="Hello - reception is on +44 1234 567890.")
+        result = await _pipeline(gateway, []).answer(prop, "hi")
+
+        assert "+44 1234 567890" in result.answer

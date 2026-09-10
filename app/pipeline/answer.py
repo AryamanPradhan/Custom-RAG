@@ -45,6 +45,7 @@ from app.pipeline.prompts import (
     build_answer_system,
     build_deflection,
     build_smalltalk,
+    build_smalltalk_system,
     build_user_turn,
 )
 from app.retrieval.rerank import rerank
@@ -230,7 +231,7 @@ class AnswerPipeline:
                 # Not a Deflection: nothing was asked and nothing failed. It
                 # cites nothing because it claims nothing.
                 Outcome(
-                    answer=build_smalltalk(intent.value, prop.display_name),
+                    answer=await self._smalltalk(prop, intent, clean),
                     stages={"intent": intent.value},
                 ),
             )
@@ -328,6 +329,59 @@ class AnswerPipeline:
             citations=build_citations(chunks, scrubbed),
             stages={"chunks": len(chunks)},
         )
+
+    async def _smalltalk(self, prop: Property, intent: Intent, message: str) -> str:
+        """The reply to a turn that asked nothing about the property.
+
+        Generated, so that "hi" and "thanks, that's exactly what I needed" do
+        not get the same sentence back. It is one call to the cheap model with
+        no retrieval, no rerank and no verifier, because there is nothing to
+        retrieve for a greeting and nothing to check it against.
+
+        That last part is why the prompt is written as a list of things not to
+        say: this is the one reply in the pipeline that reaches a Visitor
+        unverified, so it must not make a claim about the Property at all.
+        Scrubbing catches the contact details it was told not to invent - the
+        one kind of hallucination here that a Visitor would act on.
+
+        The fixed template is the fallback. A provider outage should cost a
+        Visitor some warmth, not their reply.
+        """
+        fallback = build_smalltalk(intent.value, prop.display_name)
+        # CAPABILITY describes how the Guide behaves rather than greeting
+        # anyone. That is a fact about this system, not something to improvise.
+        if intent is Intent.CAPABILITY:
+            return fallback
+
+        try:
+            with span("smalltalk", intent=intent.value) as s:
+                result = await self._gateway.complete(
+                    Task.ANSWER,
+                    system=build_smalltalk_system(prop.display_name),
+                    messages=[{"role": "user", "content": message}],
+                    max_tokens=120,
+                    property_id=prop.property_id,
+                )
+                text = scrub_answer(
+                    result.text.strip(), trusted_text=prop.contact_route.describe()
+                )
+                s.summary = (
+                    f"Wrote a {intent.value} reply."
+                    if text and not result.refused
+                    else f"Fell back to the fixed {intent.value} reply."
+                )
+        except Exception as exc:  # noqa: BLE001 - provider-specific failures
+            METRICS.incr("pipeline.smalltalk_failed", intent=intent.value)
+            log.warning(
+                "Smalltalk generation failed; using the fixed reply.",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return fallback
+
+        if result.refused or not text:
+            METRICS.incr("pipeline.smalltalk_failed", intent=intent.value)
+            return fallback
+        return text
 
     async def _rerank(
         self, question: str, chunks: list[ScoredChunk], property_id: str
