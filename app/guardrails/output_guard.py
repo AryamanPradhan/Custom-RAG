@@ -35,11 +35,26 @@ it is plausible or generally true of hotels.
 Ignore, and never report as unsupported:
 - conversational framing ("Happy to help", "Let me know if...")
 - statements that the answer does not know something
+- statements about what the sources do or do not contain ("the published \
+information doesn't say whether the hours change on public holidays", "the \
+rates page doesn't give a December rate"). These describe the sources rather \
+than the property. You cannot verify them against the sources and you are not \
+asked to: they are the answer being honest about a gap, which is the \
+behaviour we want. Never report one as unsupported, even when it sits in the \
+same answer as claims you do check.
 - suggestions to contact the property
 - general courtesy or hedging
 
 Judge only concrete claims about this property: prices, times, policies, \
-amenities, capacities, locations, availability, names.
+amenities, capacities, locations, availability, names. A statement that \
+something is NOT covered is not a claim about the property.
+
+Judge each claim against the SOURCES alone. The QUESTION is there to help you \
+read the answer, not a test the answer has to pass. An answer that addresses \
+part of the question and says the sources do not cover the rest is still \
+grounded, as long as the claims it does make are supported. Never mark a \
+supported claim unsupported because the answer left something out or because \
+the sources do not settle the whole question.
 
 Return JSON only."""
 
