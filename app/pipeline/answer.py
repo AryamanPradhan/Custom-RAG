@@ -139,7 +139,6 @@ class AnswerPipeline:
         *,
         reason: str,
         stage: str,
-        kind: str = "gap",
         metric: str | None = "pipeline.deflected",
         grounded: bool = True,
         stages: dict[str, Any] | None = None,
@@ -151,19 +150,11 @@ class AnswerPipeline:
         which is how a stage came to be counted on one transport and not on the
         other. Passing through here is what keeps the metric and the reason
         describing the same event.
-
-        `kind` picks which Deflection the Visitor reads and `stage` is what the
-        operator sees; they are deliberately not the same field. Several stages
-        are one situation to a Visitor - an uncited answer and a failed
-        grounding check are both "I could not stand behind it" - while the
-        operator needs to know which check fired.
         """
         if metric:
             METRICS.incr(metric, stage=stage)
         return Outcome(
-            answer=build_deflection(
-                prop.display_name, prop.contact_route.describe(), kind
-            ),
+            answer=build_deflection(prop.display_name, prop.contact_route.describe()),
             deflected=True,
             grounded=grounded,
             reason=reason,
@@ -197,7 +188,6 @@ class AnswerPipeline:
                     prop,
                     reason=message_verdict.reason,
                     stage="message",
-                    kind="blocked",
                     metric="pipeline.blocked",
                 ),
             )
@@ -217,7 +207,6 @@ class AnswerPipeline:
                     prop,
                     reason=history_verdict.reason,
                     stage="history",
-                    kind="blocked",
                     metric="pipeline.blocked",
                 ),
             )
@@ -274,7 +263,6 @@ class AnswerPipeline:
                     prop,
                     reason="nothing in the corpus answers this",
                     stage="retrieval",
-                    kind="gap",
                 ),
             )
 
@@ -305,7 +293,6 @@ class AnswerPipeline:
                 prop,
                 reason="answer model declined or returned nothing",
                 stage="generation",
-                kind="failed",
             )
 
         # An answer that cites nothing claims nothing: the system prompt is
@@ -316,10 +303,7 @@ class AnswerPipeline:
         # could be hiding in it is a claim the model chose not to cite.
         if not build_citations(chunks, text):
             return self._decline(
-                prop,
-                reason="the answer cited nothing",
-                stage="uncited",
-                kind="unverified",
+                prop, reason="the answer cited nothing", stage="uncited"
             )
 
         verdict = await verify_grounding(
@@ -334,7 +318,6 @@ class AnswerPipeline:
                 prop,
                 reason=verdict.detail or "answer was not supported by the sources",
                 stage="grounding",
-                kind="unverified",
                 grounded=False,
                 stages={"unsupported_claims": verdict.unsupported_claims},
             )
@@ -652,11 +635,7 @@ class AnswerPipeline:
             log.error("Answer generation failed mid-stream; retracting.",
                       error=f"{type(exc).__name__}: {exc}")
             failed = self._decline(
-                prop,
-                reason="generation failed",
-                stage="generation",
-                kind="failed",
-                metric=None,
+                prop, reason="generation failed", stage="generation", metric=None
             )
             draft.outcome = failed
             yield self._retract(failed)
