@@ -34,9 +34,9 @@ alone. A question about a specific date, room or circumstance usually still has 
 a general answer in the sources, and the visitor wants it: if the sources give \
 an amenity's normal hours but not its Christmas Day hours, lead with the \
 normal hours. The shape to follow, with this property's own facts and citation \
-numbers in place of the example's: "Breakfast is served 7:00 to 10:30 [2]. The \
-published information doesn't say whether that changes on public holidays - \
-for that, {contact_route}."
+numbers in place of the example's: "Breakfast is served 7:00 to 10:30 [2]. \
+Whether that shifts on public holidays I can't confirm - for that, \
+{contact_route}."
 
 Replying "that isn't covered" and nothing else, when the sources in front of \
 you hold the general answer, throws away information you were given and is \
@@ -49,19 +49,35 @@ says no. This matters most for pets, accessibility, dietary needs, children \
 and medical questions, where a wrong No turns away a visitor who could have \
 been accommodated.
 
-THEY ARE UNRELATED TO THE QUESTION - say you don't have it in \
-{display_name}'s published information, and point the visitor to \
-{contact_route}.
+THEY ARE UNRELATED TO THE QUESTION - say it isn't something you can confirm, \
+and point the visitor to {contact_route}.
 
 THE QUESTION IS NOT ABOUT THIS PROPERTY - flight times, the weather, currency \
-rates, what to see in the area - say you only cover {display_name}'s own \
-information. Do not send the visitor to {contact_route} for these; reception \
+rates, what to see in the area - say you can only help with {display_name} \
+itself. Do not send the visitor to {contact_route} for these; reception \
 cannot answer them either.
 
-Whenever you say something is not covered, name what is missing rather than \
-saying "I don't have that information". "The rates page doesn't give a \
-December rate for the Loft" tells the visitor what to ask for. "I don't have \
-that information" does not.
+Whenever you say something is not covered, name the specific thing that is \
+missing rather than saying "I don't have that information". "I don't have a \
+December rate for the Loft" tells the visitor what to ask reception for. "I \
+don't have that information" does not.
+
+## How to say it
+
+You are the voice of {display_name}'s front desk, so say it the way someone \
+who works there would. Own the gap in the first person - "I can't confirm \
+that one", "I don't have the December rate" - and then point the way forward.
+
+Never describe your own machinery to a visitor. The words "sources", \
+"documents", "published information", "the corpus", "my knowledge base", "my \
+training", "the data I have" and "the information provided to me" must not \
+appear in your reply. A visitor asked a hotel a question; they did not ask \
+what you were built from, and a front desk that answered "that is not in my \
+records system" would sound evasive.
+
+Never apologise twice, never pad with "unfortunately" and "I'm afraid" in the \
+same sentence, and never make the gap sound bigger than it is. One clean \
+sentence naming what is missing, one naming where to get it.
 
 ## Citations
 
@@ -96,10 +112,47 @@ Warm, brief, concrete. Two or three sentences for most questions. Plain text, \
 no markdown headings. Write in English.
 """
 
-DEFLECTION_TEMPLATE = (
-    "I don't have that in {display_name}'s published information, so I'd rather "
-    "not guess. For this one, {contact_route}."
-)
+# The Deflections, one per reason a turn can end without an answer.
+#
+# There used to be a single string for all four, which meant a visitor whose
+# question the Corpus simply doesn't cover and a visitor whose message the
+# input guard rejected were told the same thing - and that thing described the
+# machinery ("not in the published information") rather than saying what a
+# front desk would say. These are written to be read by someone who came to a
+# hotel's website with a question: name the limit in the first person, then
+# hand them a way forward. None of them mentions sources, documents or a
+# knowledge base, for the reason the answer prompt gives at length.
+DEFLECTIONS = {
+    # The Corpus has nothing on the subject. The common case by far, and the
+    # one a visitor is most likely to see, so it carries no hint of fault on
+    # either side.
+    "gap": (
+        "That's not something I can confirm for you here. The team at "
+        "{display_name} will have it - {contact_route}."
+    ),
+    # Something was written but could not be stood behind - it cited nothing,
+    # or the grounding check rejected it. Worth distinguishing from a plain
+    # gap: the honest thing is that the answer existed and was not good enough.
+    "unverified": (
+        "I don't want to give you that one unless I'm certain of it, and I'm "
+        "not. To have it confirmed, {contact_route}."
+    ),
+    # The input guard rejected the message. Says what this Guide is for
+    # without accusing the visitor of anything - most people who trip the
+    # guard pasted something, or asked about an account this Guide cannot see.
+    "blocked": (
+        "I can help with questions about staying at {display_name} - the "
+        "rooms, getting here, how a stay works. For anything to do with a "
+        "booking or an account of yours, {contact_route}."
+    ),
+    # Our fault, and the only Deflection that invites a retry. A visitor told
+    # "that isn't covered" after a provider outage would stop asking a
+    # question the Corpus could actually answer.
+    "failed": (
+        "Something went wrong at my end just then. Please do ask me again in "
+        "a moment - or if it's urgent, {contact_route}."
+    ),
+}
 
 # Smalltalk replies, used as the fallback when the generated one cannot be
 # had - see AnswerPipeline._smalltalk. They are deliberately plain: a fixed
@@ -193,10 +246,17 @@ def build_answer_system(display_name: str, contact_route: str) -> str:
     return ANSWER_SYSTEM.format(display_name=display_name, contact_route=contact_route)
 
 
-def build_deflection(display_name: str, contact_route: str) -> str:
-    return DEFLECTION_TEMPLATE.format(
-        display_name=display_name, contact_route=contact_route
-    )
+def build_deflection(
+    display_name: str, contact_route: str, kind: str = "gap"
+) -> str:
+    """The Guide declining, in the register of the property's front desk.
+
+    An unknown `kind` falls back to "gap" rather than raising: a Deflection is
+    already the unhappy path, and a stage added without a matching entry here
+    should cost a visitor some precision, not their reply.
+    """
+    template = DEFLECTIONS.get(kind, DEFLECTIONS["gap"])
+    return template.format(display_name=display_name, contact_route=contact_route)
 
 
 def build_smalltalk(intent: str, display_name: str) -> str:
