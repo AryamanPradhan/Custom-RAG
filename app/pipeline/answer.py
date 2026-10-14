@@ -293,12 +293,12 @@ class AnswerPipeline:
     ) -> Outcome:
         """Everything between a generated answer and a servable one.
 
-        Four policies decide whether a Visitor may see what the model wrote: it
-        declined, it cited nothing, it was not grounded, and whatever scrubbing
-        left behind. Each used to be written once per transport, which is how
-        the streaming path came to count one stage differently from the JSON
-        path and to carry groundedness by a different route. They run here so a
-        rule added to the sequence arrives on both surfaces at once.
+        Three policies decide whether a Visitor may see what the model wrote:
+        it declined, it was not grounded, and whatever scrubbing left behind.
+        Each used to be written once per transport, which is how the streaming
+        path came to count one stage differently from the JSON path and to
+        carry groundedness by a different route. They run here so a rule added
+        to the sequence arrives on both surfaces at once.
         """
         if refused or not text.strip():
             return self._decline(
@@ -308,20 +308,18 @@ class AnswerPipeline:
                 kind="failed",
             )
 
-        # An answer that cites nothing claims nothing: the system prompt is
-        # explicit that a claim about the property must carry its [n]. So an
-        # uncited answer is a non-answer however warmly it is phrased, and it
-        # becomes a Deflection without a verifier call - which is both cheaper
-        # and safer than showing unverified prose, since the one thing that
-        # could be hiding in it is a claim the model chose not to cite.
-        if not build_citations(chunks, text):
-            return self._decline(
-                prop,
-                reason="the answer cited nothing",
-                stage="uncited",
-                kind="unverified",
-            )
-
+        # A missing [n] marker used to be fatal on its own - the whole answer
+        # was discarded without the verifier ever seeing it, on the theory
+        # that an uncited claim is a claim that model chose not to stand
+        # behind. In practice the cheap answer model drops a marker on a
+        # correct, true sentence often enough that this was deflecting
+        # visitors away from answers that were right. The verifier is the
+        # actual judge of whether a claim is supported - it reads the answer
+        # against the sources regardless of which sentences carry a [n] - so
+        # it now runs unconditionally, and citations are simply whatever
+        # `build_citations` can extract from what the model wrote. An answer
+        # that cites nothing but is independently confirmed grounded reaches
+        # the Visitor with no citation list rather than no answer.
         verdict = await verify_grounding(
             question=question,
             answer=text,
@@ -341,9 +339,12 @@ class AnswerPipeline:
 
         contact = prop.contact_route.describe()
         scrubbed = scrub_answer(text, trusted_text=context + " " + contact)
+        cited = build_citations(chunks, scrubbed)
+        if not cited:
+            METRICS.incr("pipeline.uncited_but_grounded")
         return Outcome(
             answer=scrubbed,
-            citations=build_citations(chunks, scrubbed),
+            citations=cited,
             stages={"chunks": len(chunks)},
         )
 

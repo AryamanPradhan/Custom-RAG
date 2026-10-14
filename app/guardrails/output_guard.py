@@ -97,51 +97,64 @@ async def verify_grounding(
 ) -> GroundingVerdict:
     """Check an answer against its sources.
 
-    On verifier failure the answer is blocked, not passed. If the check cannot
-    run, we have no evidence the answer is grounded - and this pipeline's whole
-    safety argument rests on that check running.
+    On verifier failure the answer is blocked, not passed - but only after a
+    second attempt. A blocked answer and a wrong answer look identical to the
+    Visitor, and a single dropped connection or rate-limit blip on the
+    verifier's provider used to cost them a correct answer outright. One retry
+    absorbs that without weakening the guarantee: if the verifier genuinely
+    cannot be reached, we still have no evidence of groundedness, and the
+    answer is still blocked.
     """
     if not answer.strip():
         return GroundingVerdict(grounded=False, detail="empty answer")
 
     with span("verify_grounding") as s:
-        try:
-            result = await gateway.complete(
-                Task.VERIFY,
-                system=VERIFIER_SYSTEM,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"SOURCES:\n{context}\n\n"
-                            f"QUESTION: {question}\n\n"
-                            f"ANSWER:\n{answer}"
-                        ),
-                    }
-                ],
-                max_tokens=700,
-                json_schema=_SCHEMA,
-                property_id=property_id,
-            )
-            data = json.loads(result.text)
-            verdict = GroundingVerdict(
-                grounded=bool(data.get("grounded", False)),
-                unsupported_claims=list(data.get("unsupported_claims", []) or []),
-            )
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            METRICS.incr("guard.verifier_unparseable")
-            log.error("Verifier returned unusable output; blocking the answer.",
-                      error=str(exc))
-            return GroundingVerdict(
-                grounded=False, checked=False, detail=f"verifier returned unusable output: {exc}"
-            )
-        except Exception as exc:  # noqa: BLE001 - provider-specific failures
-            METRICS.incr("guard.verifier_failed")
-            log.error("Verifier call failed; blocking the answer.",
-                      error=f"{type(exc).__name__}: {exc}")
-            return GroundingVerdict(
-                grounded=False, checked=False, detail=f"verifier unavailable: {exc}"
-            )
+        verdict: GroundingVerdict | None = None
+        last_error = ""
+        for attempt in range(2):
+            try:
+                result = await gateway.complete(
+                    Task.VERIFY,
+                    system=VERIFIER_SYSTEM,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"SOURCES:\n{context}\n\n"
+                                f"QUESTION: {question}\n\n"
+                                f"ANSWER:\n{answer}"
+                            ),
+                        }
+                    ],
+                    max_tokens=700,
+                    json_schema=_SCHEMA,
+                    property_id=property_id,
+                )
+                data = json.loads(result.text)
+                verdict = GroundingVerdict(
+                    grounded=bool(data.get("grounded", False)),
+                    unsupported_claims=list(data.get("unsupported_claims", []) or []),
+                )
+                break
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                last_error = f"verifier returned unusable output: {exc}"
+                METRICS.incr("guard.verifier_unparseable", retry=str(attempt == 1))
+                log.warning(
+                    "Verifier returned unusable output.",
+                    attempt=attempt, error=str(exc),
+                )
+            except Exception as exc:  # noqa: BLE001 - provider-specific failures
+                last_error = f"verifier unavailable: {exc}"
+                METRICS.incr("guard.verifier_failed", retry=str(attempt == 1))
+                log.warning(
+                    "Verifier call failed.",
+                    attempt=attempt, error=f"{type(exc).__name__}: {exc}",
+                )
+
+        if verdict is None:
+            log.error("Verifier unusable after retrying; blocking the answer.",
+                      error=last_error)
+            return GroundingVerdict(grounded=False, checked=False, detail=last_error)
 
         s.attributes["grounded"] = verdict.grounded
         s.attributes["unsupported"] = len(verdict.unsupported_claims)

@@ -21,12 +21,19 @@ import re
 # "can I ignore the road noise", "does it have an air conditioning system".
 _INJECTION_RULES: list[tuple[str, re.Pattern[str]]] = [
     (
-        # "ignore previous instructions", "disregard all prior rules"
+        # "ignore previous instructions", "disregard all prior commands"
+        #
+        # "rule" used to sit in this noun group, which caught "can I ignore
+        # all the rules about check-in time" - a visitor asking about an
+        # exception to the house rules, not an attack. A real injection
+        # attempt says "instructions" or "prompt"; a guest says "rules".
+        # override_own_instructions below still catches "ignore your rules"
+        # phrased as this Guide's own configuration.
         "override_instructions",
         re.compile(
             r"\b(ignore|disregard|override|bypass|forget)\b[^.\n]{0,40}?"
             r"\b(previous|prior|above|earlier|all|any)\b[^.\n]{0,40}?"
-            r"\b(instruction|prompt|rule|direction|command|guideline)s?\b",
+            r"\b(instruction|prompt|direction|command|guideline)s?\b",
             re.I,
         ),
     ),

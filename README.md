@@ -31,7 +31,7 @@ A fixed pipeline, not an agent loop — see [ADR 0001](docs/adr/0001-fixed-pipel
 | **Retrieve** | Hybrid dense + BM25 over Qdrant, fused with RRF, scoped to one property. One pass over the whole corpus — [no category filter](docs/adr/0005-no-category-filter-on-retrieval.md) |
 | **Rerank** | Cohere rerank-v3.5 scores the 40 candidates; nothing above threshold means deflect, don't answer |
 | **Answer** | GPT-4o mini, sources fenced as data, citations required per claim |
-| **Verify** | A second GPT-4o mini pass checks every property-specific claim against the sources. **Blocking**. An uncited answer skips the call and deflects — it claims nothing |
+| **Verify** | A second GPT-4o mini pass checks every property-specific claim against the sources. **Blocking**, and it runs on every answer, cited or not — an answer missing its `[n]` marker is shown with no citation list if the verifier confirms it anyway, rather than discarded on the marker alone |
 | **Cite** | Returns only the sources the answer actually cited, date-stamped — then strips the `[n]` markers, which are provenance for the pipeline and clutter on screen |
 
 Routed per task through one gateway — see [ADR 0002](docs/adr/0002-three-model-providers.md).

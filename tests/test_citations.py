@@ -169,7 +169,9 @@ class TestBuildCitations:
         assert [c.index for c in cited] == [1, 3]
 
     def test_an_uncited_answer_cites_nothing(self) -> None:
-        """What makes an uncited answer a deflection rather than a reply."""
+        """No [n] markers means no citation list - the pipeline still shows
+        the answer if the verifier confirms it is grounded, just with an empty
+        `citations`, rather than discarding it for lacking markers."""
         assert build_citations([_chunk("A.")], "I don't have that.") == []
 
     def test_it_must_run_before_stripping(self) -> None:

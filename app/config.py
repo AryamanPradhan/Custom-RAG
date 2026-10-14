@@ -94,10 +94,14 @@ class Settings(BaseSettings):
     # everything or nothing:
     #   min_rerank_score      0-10 rubric, when RERANK_MODEL is a chat model
     #   min_rerank_relevance  0-1 relevance, when it is a Cohere reranker
-    # Cohere's scores are not calibrated across queries, so treat 0.2 as a
+    # Cohere's scores are not calibrated across queries, so treat these as a
     # starting point to tune against the eval set, not a validated value.
-    min_rerank_score: int = 4
-    min_rerank_relevance: float = 0.2
+    # Lowered from 4 / 0.2: at the old floor, a passage that covered part of
+    # the question but not all of it - scored 3-4 on the rubric - was being
+    # thrown out, and the question deflected as "nothing in the corpus" even
+    # though the Corpus had a partial, citable answer.
+    min_rerank_score: int = 3
+    min_rerank_relevance: float = 0.15
 
     # ---- Serving --------------------------------------------------------
     log_level: str = "INFO"

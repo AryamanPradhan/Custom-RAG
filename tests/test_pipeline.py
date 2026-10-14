@@ -166,9 +166,8 @@ class TestAnswering:
     async def test_the_verifier_always_runs(self, prop: Property) -> None:
         """The safety argument for a small answer model rests on this.
 
-        "Always" means every answer a Visitor is shown. The one path that skips
-        the call deflects instead of showing anything - see
-        `test_deflects_when_the_answer_cites_nothing`.
+        "Always" means every answer a Visitor is shown, cited or not - see
+        `test_uncited_but_grounded_answer_is_still_served`.
         """
         gateway = FakeGateway()
         pipeline = _pipeline(gateway, [_chunk("Check-in is from 2pm.")])
@@ -202,12 +201,31 @@ class TestDeflection:
         assert "24 hours" not in result.answer
         assert "+44 1234 567890" in result.answer
 
-    async def test_deflects_when_the_answer_cites_nothing(self, prop: Property) -> None:
-        """An uncited answer claims nothing it is willing to stand behind, so
-        it is a non-answer however warmly it is phrased - and it must not be
-        shown on the strength of a verifier that was never asked."""
+    async def test_uncited_but_grounded_answer_is_still_served(self, prop: Property) -> None:
+        """A missing [n] marker alone no longer kills an answer.
+
+        The cheap answer model sometimes writes a correct, supported sentence
+        and forgets its citation marker. The verifier - not the presence of a
+        marker - is what decides whether a claim is safe to show, so this
+        answer reaches the Visitor with an empty citation list rather than
+        being discarded."""
+        gateway = FakeGateway(answer="Check-in is from 2pm, no marker needed.")
+        pipeline = _pipeline(gateway, [_chunk("Check-in is from 2pm.")])
+        result = await pipeline.answer(prop, "what time is check-in?")
+
+        assert not result.deflected
+        assert result.grounded
+        assert result.citations == []
+        assert "verify" in gateway.calls
+
+    async def test_deflects_when_the_answer_is_uncited_and_ungrounded(
+        self, prop: Property
+    ) -> None:
+        """An uncited answer is still judged, and still blocked when the
+        verifier cannot support it - the marker was never the safety net."""
         gateway = FakeGateway(
-            answer="I'm afraid the sources don't mention that. Do call the property."
+            answer="I'm afraid the sources don't mention that. Do call the property.",
+            grounded=False,
         )
         pipeline = _pipeline(gateway, [_chunk("Check-in is from 2pm.")])
         result = await pipeline.answer(prop, "is there parking?")
@@ -215,7 +233,7 @@ class TestDeflection:
         assert result.deflected
         assert "do call the property" not in result.answer.lower()
         assert "+44 1234 567890" in result.answer
-        assert "verify" not in gateway.calls, "an uncited answer costs no verifier call"
+        assert "verify" in gateway.calls
 
     async def test_deflects_on_prompt_injection(self, prop: Property) -> None:
         gateway = FakeGateway()
@@ -336,13 +354,6 @@ class TestBothTransportsDecideAlike:
 
     CASES = [
         pytest.param(
-            "Check-in is from 2pm.",
-            True,
-            True,
-            "the answer cited nothing",
-            id="uncited",
-        ),
-        pytest.param(
             "",
             True,
             True,
@@ -416,6 +427,31 @@ class TestBothTransportsDecideAlike:
         assert [c["index"] for c in cited["citations"]] == [
             c.index for c in served.citations
         ]
+
+    async def test_an_uncited_but_grounded_answer_is_served_the_same_way(
+        self, prop: Property
+    ) -> None:
+        """The citations event still fires - just empty - rather than the
+        widget being left to infer an uncited answer was actually a decline."""
+        chunks = [_chunk("Check-in is from 2pm.")]
+        no_marker = "Check-in is from 2pm, no marker needed."
+
+        served = await _pipeline(BothTransports(answer=no_marker), chunks).answer(
+            prop, "what time is check-in?"
+        )
+        events = [
+            e
+            async for e in _pipeline(BothTransports(answer=no_marker), chunks).stream(
+                prop, "what time is check-in?"
+            )
+        ]
+
+        cited = next(e for e in events if e["type"] == "citations")
+
+        assert not served.deflected
+        assert events[-1]["deflected"] is False
+        assert served.citations == []
+        assert cited["citations"] == []
 
 
 class TestStreamRendering:
